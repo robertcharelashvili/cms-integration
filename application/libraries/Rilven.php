@@ -59,6 +59,9 @@ class Rilven
     /** @var Rilven_financing */
     private $financing;
 
+    /** @var Rilven_clearing */
+    private $clearing;
+
     /** Reasons rows were refused in this run, for the caller to print. */
     public $refusals = array();
 
@@ -77,6 +80,7 @@ class Rilven
         $this->CI->load->library('rilven_cash');
         $this->CI->load->library('rilven_deposit');
         $this->CI->load->library('rilven_financing');
+        $this->CI->load->library('rilven_clearing');
         $this->client     = $this->CI->rilven_client;
         $this->contractor = $this->CI->rilven_contractor;
         $this->insurer    = $this->CI->rilven_insurer;
@@ -86,6 +90,7 @@ class Rilven
         $this->cash       = $this->CI->rilven_cash;
         $this->deposit    = $this->CI->rilven_deposit;
         $this->financing  = $this->CI->rilven_financing;
+        $this->clearing   = $this->CI->rilven_clearing;
         $this->CI->load->database();
     }
 
@@ -107,6 +112,11 @@ class Rilven
     public function financing()
     {
         return $this->financing;
+    }
+
+    public function clearing()
+    {
+        return $this->clearing;
     }
 
     public function category()
@@ -166,7 +176,7 @@ class Rilven
         $names = array();
         foreach (array($this->cash, $this->category, $this->service,
                        $this->contractor, $this->insurer, $this->sale,
-                       $this->financing, $this->deposit) as $register) {
+                       $this->financing, $this->deposit, $this->clearing) as $register) {
             $names[] = $register->entity();
         }
         return $names;
@@ -184,8 +194,11 @@ class Rilven
         // patients do: a case that names one is refused until it has travelled.
         // Financing goes AFTER sale and before deposits: a settlement names the case's
         // document, and a case that has not travelled yet has no document to name.
+        // Clearing goes LAST of the documents: it settles an advance against a receivable, and
+        // both have to exist first -- the receivable from the case, the advance from the deposit.
         $all = array($this->cash, $this->category, $this->service, $this->contractor,
-                     $this->insurer, $this->sale, $this->financing, $this->deposit);
+                     $this->insurer, $this->sale, $this->financing, $this->deposit,
+                     $this->clearing);
 
         $enabled = array();
         foreach ($all as $register) {
@@ -487,6 +500,9 @@ class Rilven
                 $queued += $this->backfillFinancing($limit);
                 // Deliberately NOT given $limit -- see the method.
                 $queued += $this->refreshFinancingByFingerprint();
+            } elseif ($entity === 'clearing') {
+                $queued += $this->backfillClearing($limit);
+                $queued += $this->refreshClearingByFingerprint();
             } elseif ($entity === 'sale') {
                 $queued += $this->backfillSales($limit);
                 $queued += $this->refreshSales($limit);
@@ -1344,6 +1360,9 @@ class Rilven
         if ($entity === 'financing') {
             return $this->financingRow($sourceId);
         }
+        if ($entity === 'clearing') {
+            return $this->clearingRow($sourceId);
+        }
         if ($entity === 'category') {
             return $this->categoryRow($sourceId);
         }
@@ -1635,6 +1654,194 @@ class Rilven
         } catch (Exception $e) {
             log_message('error', 'rilven: financing fingerprint failed: ' . $e->getMessage());
             return NULL;
+        }
+    }
+
+    /**
+     * One case, with what the patient has actually paid against it.
+     *
+     * The receipts are `type = 'received'` rows -- the ones that landed on 3120 as an advance.
+     * Unlike the accruing rows they SURVIVE an edit: Sales_model deletes only `accruing`, so a
+     * payment keeps its id and a settlement line can be keyed on it.
+     *
+     * Answers NULL when nothing has been paid. Not an error: a case nobody has paid for yet has
+     * no advance to settle, and a document saying otherwise would be a lie about a balance.
+     */
+    public function clearingRow($sourceId)
+    {
+        $table = (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $this->CI->db->from($table . ' s')->select('s.*')->where('s.id', $sourceId);
+        $this->applySaleScope('s.');
+        $row = $this->CI->db->get()->row();
+        if (!$row) {
+            return NULL;
+        }
+
+        $row->payments = $this->casePayments($row->id);
+        if (empty($row->payments)) {
+            return NULL;
+        }
+
+        $this->attachPatientIds($row);
+        return $row;
+    }
+
+    /** The receipts of one case: what the patient handed over, by whatever means. */
+    private function casePayments($saleId)
+    {
+        $payments = (string) $this->client->cfg('rilven_clearing_source_table', 'payments');
+        $methods  = $this->client->cfg('rilven_clearing_paid_by', array('cash', 'CC', 'payment_link'));
+
+        $this->CI->db->from($payments . ' p')->select('p.*')
+            ->where('p.sale_id', $saleId)
+            ->where('p.type', (string) $this->client->cfg('rilven_clearing_payment_type', 'received'))
+            ->where('p.amount >', 0)
+            ->order_by('p.id', 'ASC');
+        if (is_array($methods) && !empty($methods)) {
+            $this->CI->db->where_in('p.paid_by', $methods);
+        }
+        return $this->CI->db->get()->result();
+    }
+
+    /** Queue the cases with a payment that the outbox has never heard of. */
+    public function backfillClearing($limit = 2000)
+    {
+        $prefix   = $this->CI->db->dbprefix;
+        $sales    = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $payments = $prefix . (string) $this->client->cfg('rilven_clearing_source_table', 'payments');
+        $type     = (string) $this->client->cfg('rilven_clearing_payment_type', 'received');
+
+        $this->CI->db->select('s.id')->from($sales . ' s')->order_by('s.id', 'ASC')->limit((int) $limit);
+        $this->applySaleScope('s.');
+
+        $this->CI->db->where('NOT EXISTS (SELECT 1 FROM ' . $prefix . 'rilven_outbox o'
+            . " WHERE o.entity = 'clearing' AND o.external_id = CAST(s.id AS CHAR))", NULL, FALSE);
+
+        $this->CI->db->where('EXISTS (SELECT 1 FROM ' . $payments . ' p'
+            . ' WHERE p.sale_id = s.id AND p.type = ' . $this->CI->db->escape($type)
+            . ' AND p.amount > 0 AND ' . $this->paidBySql('p.') . ')', NULL, FALSE);
+
+        $queued = 0;
+        foreach ($this->CI->db->get()->result() as $row) {
+            $this->enqueue('clearing', $row->id, $this->clearing->typeCode());
+            $queued++;
+        }
+        return $queued;
+    }
+
+    /**
+     * Re-open the settlements whose payments have moved since they were last sent.
+     *
+     * A patient pays again, or a payment is corrected, and the case itself is untouched -- so
+     * neither the sale sweep nor the financing one would notice. This is the same net under the
+     * same hole, for the other half of the money.
+     */
+    public function refreshClearingByFingerprint($limit = 0)
+    {
+        if (!$this->clearing->enabled()) {
+            return 0;
+        }
+        $rows = $this->clearingFingerprints($limit, NULL);
+        if ($rows === NULL) {
+            return 0;
+        }
+
+        $queued = 0;
+        foreach ($rows as $row) {
+            if ($row->source_fingerprint === NULL || $row->source_fingerprint === '') {
+                $this->CI->db->where('id', $row->outbox_id)
+                             ->update('rilven_outbox', array('source_fingerprint' => $row->fingerprint));
+                continue;
+            }
+            if ($row->source_fingerprint === $row->fingerprint) {
+                continue;
+            }
+            $this->enqueue('clearing', $row->id, $this->clearing->typeCode());
+            $queued++;
+        }
+        return $queued;
+    }
+
+    /**
+     * What each case's payments look like now, beside what was last sent.
+     *
+     * Over the payment's id and its amount. The id is safe here, unlike in the financing digest:
+     * a `received` row survives an edit, so an unchanged case gives an unchanged digest.
+     */
+    private function clearingFingerprints($limit, $onlySaleId = NULL)
+    {
+        try {
+            $this->CI->db->query('SET SESSION group_concat_max_len = 1000000');
+        } catch (Exception $e) {
+            log_message('error', 'rilven: cannot raise group_concat_max_len, '
+                . 'skipping the clearing sweep: ' . $e->getMessage());
+            return NULL;
+        }
+
+        $prefix   = $this->CI->db->dbprefix;
+        $sales    = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $payments = $prefix . (string) $this->client->cfg('rilven_clearing_source_table', 'payments');
+        $type     = (string) $this->client->cfg('rilven_clearing_payment_type', 'received');
+
+        $digest = "MD5(COALESCE(GROUP_CONCAT("
+                . " CONCAT_WS(':', p.id, p.amount, p.company_id)"
+                . " ORDER BY p.id SEPARATOR ','), ''))";
+
+        $this->CI->db
+            ->select('s.id, o.id AS outbox_id, o.source_fingerprint, ' . $digest . ' AS fingerprint', FALSE)
+            ->from($sales . ' s')
+            ->join($prefix . 'rilven_outbox o',
+                   "o.entity = 'clearing' AND o.external_id = CAST(s.id AS CHAR)", 'inner', FALSE)
+            ->join($payments . ' p',
+                   'p.sale_id = s.id AND p.type = ' . $this->CI->db->escape($type)
+                   . ' AND p.amount > 0 AND ' . $this->paidBySql('p.'), 'left', FALSE)
+            ->group_by('s.id, o.id, o.source_fingerprint')
+            ->order_by('s.id', 'ASC');
+
+        if ($onlySaleId === NULL) {
+            $this->CI->db->where('o.status', self::SENT);
+        } else {
+            $this->CI->db->where('s.id', $onlySaleId);
+        }
+        if ((int) $limit > 0) {
+            $this->CI->db->limit((int) $limit);
+        }
+        $this->applySaleScope('s.');
+
+        try {
+            return $this->CI->db->get()->result();
+        } catch (Exception $e) {
+            log_message('error', 'rilven: clearing fingerprint failed: ' . $e->getMessage());
+            return NULL;
+        }
+    }
+
+    /** The configured payment methods as a raw fragment, for use inside a join or an EXISTS. */
+    private function paidBySql($alias)
+    {
+        $methods = $this->client->cfg('rilven_clearing_paid_by', array('cash', 'CC', 'payment_link'));
+        if (!is_array($methods) || empty($methods)) {
+            return '1 = 1';
+        }
+        $escaped = array();
+        foreach ($methods as $one) {
+            $escaped[] = $this->CI->db->escape($one);
+        }
+        return $alias . 'paid_by IN (' . implode(', ', $escaped) . ')';
+    }
+
+    /** Hook for the CMS: a payment was taken, so the case's cleared amount has moved. */
+    public function queueClearing($saleId)
+    {
+        try {
+            $row = $this->clearingRow($saleId);
+            if (!$row) {
+                return FALSE;
+            }
+            return $this->enqueue('clearing', $row->id, $this->clearing->typeCode());
+        } catch (Exception $e) {
+            log_message('error', 'rilven: queueClearing failed for ' . $saleId . ': ' . $e->getMessage());
+            return FALSE;
         }
     }
 
@@ -2165,13 +2372,17 @@ class Rilven
         // source still what we last sent?", and a fingerprint left stale answers "no" for ever.
         // The sweep then re-opens the row every minute and the send closes it again -- measured
         // on the clinic 2026-09-20, three cases and 4 320 requests a day.
-        if ($entity !== 'sale' && $entity !== 'financing') {
+        if ($entity !== 'sale' && $entity !== 'financing' && $entity !== 'clearing') {
             return;
         }
         try {
-            $rows = $entity === 'financing'
-                ? $this->financingFingerprints(1, (string) $saleId)
-                : $this->saleFingerprints(1, (string) $saleId);
+            if ($entity === 'financing') {
+                $rows = $this->financingFingerprints(1, (string) $saleId);
+            } elseif ($entity === 'clearing') {
+                $rows = $this->clearingFingerprints(1, (string) $saleId);
+            } else {
+                $rows = $this->saleFingerprints(1, (string) $saleId);
+            }
             if (!empty($rows)) {
                 $this->CI->db->where('id', $outboxId)
                      ->update('rilven_outbox', array('source_fingerprint' => $rows[0]->fingerprint));

@@ -1026,3 +1026,35 @@ $config['rilven_financing_currency_id']       = 44;
 
 $config['rilven_financing_code_prefix'] = '';
 
+
+// ---------------------------------------------------------------------------
+// THE ADVANCE MEETS THE DEBT -- Дт3120 / Кт1410
+// ---------------------------------------------------------------------------
+//
+// Every payment lands on 3120, advances received, because the money arrives before anything is
+// performed -- Дт1110 from the till, Дт1210 from the bank. Correct, and it never came back: no
+// rule in this chart posted 3120/1410 at all, so a patient who had paid in full still showed a
+// full receivable with the advance sitting beside it. The clinic's auditor asked for this leg.
+//
+// One settlement per case, one line per payment, both sides the SAME patient: their own advance
+// against their own debt.
+$config['rilven_clearing_enabled'] = FALSE;
+
+// `received` rows, paid by these means, with a positive amount. A refund is a different event
+// and is NOT settled here: posting it through this rule would credit a receivable that was never
+// charged.
+$config['rilven_clearing_source_table'] = 'payments';
+$config['rilven_clearing_payment_type'] = 'received';
+$config['rilven_clearing_paid_by']      = array('cash', 'CC', 'payment_link');
+
+// Дт3120 / Кт1410, from db/settlement_clearing.sql.
+$config['rilven_clearing_helper'] = 2856;
+
+// A code of its own, so the clearing document and the financier one can both exist for the same
+// case: the shares are known when the case is accrued, the payments arrive later and keep
+// arriving, and sharing a document would mean re-opening a posted one every time somebody paid.
+$config['rilven_clearing_code_prefix'] = 'p';
+
+$config['rilven_clearing_company_branch_id'] = 30;
+$config['rilven_clearing_currency_id']       = 44;
+
