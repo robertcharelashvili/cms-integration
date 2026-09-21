@@ -130,6 +130,78 @@ class Rilven_financing
     }
 
     // -----------------------------------------------------------------------
+    // references
+    // -----------------------------------------------------------------------
+
+    /**
+     * What this register needs resolved before it can send anything.
+     *
+     * Almost nothing, and that is the design: the patient's branch, the financier's branch, the
+     * case's document and the service are all read out of our own outbox, recorded there by the
+     * registers that sent them. Nothing is asked of Rilven to resolve a reference, so this
+     * register cannot be stopped by a permission it was never granted -- which is exactly what
+     * stopped the insurer register on its first run.
+     *
+     * The branch, the currency and the two posting rules are configuration, not lookups.
+     */
+    public function references($refresh = FALSE)
+    {
+        return array(
+            'companyBranchId'   => $this->intOrNull($this->client->cfg('rilven_financing_company_branch_id', NULL)),
+            'currencyId'        => $this->intOrNull($this->client->cfg('rilven_financing_currency_id', NULL)),
+            'helperShare'       => $this->intOrNull($this->client->cfg('rilven_financing_helper_share', NULL)),
+            'helperConcession'  => $this->intOrNull($this->client->cfg('rilven_financing_helper_concession', NULL)),
+            'notes'             => array(),
+        );
+    }
+
+    /**
+     * What is missing, by name, so the run stops ONCE instead of refusing every row for it.
+     *
+     * A settlement cannot be written without a branch, a currency and the rule that says which
+     * pair of accounts to post to. Without this the first tick would reject a hundred and
+     * forty-seven cases one at a time, each with the same sentence, and the log would say
+     * nothing a person could act on.
+     *
+     * The concession rule is NOT required. A clinic that never gives a service away never needs
+     * it, and demanding it would stop a register that has everything it actually uses.
+     */
+    public function missingReferences($refs)
+    {
+        $missing = array();
+        if ($refs['companyBranchId'] === NULL) { $missing[] = 'companyBranchId'; }
+        if ($refs['currencyId'] === NULL)      { $missing[] = 'currencyId'; }
+        if ($refs['helperShare'] === NULL)     { $missing[] = 'helperShare'; }
+        return $missing;
+    }
+
+    /**
+     * The case no longer has a financier share: take the settlement away.
+     *
+     * Called by the orchestrator when the source row has gone out of scope, which for this
+     * register means the shares were removed or zeroed. A settlement that moves nothing is not
+     * harmless — it is a document claiming a receivable belongs to somebody, still sitting in
+     * the register for a person to post.
+     *
+     * A POSTED one is refused rather than unposted. Its lines hold the ids of real ledger
+     * entries, and taking those out of the books because a row changed in the CMS is a person's
+     * decision — the same line {@see push} draws.
+     */
+    public function remove($rilvenId)
+    {
+        $answer = $this->client->request('DELETE', '/settlement/delete',
+                                         array('ids' => array((int) $rilvenId)));
+        if ($answer['ok']) {
+            return array('ok' => TRUE, 'error' => '', 'retryable' => FALSE);
+        }
+        if (strpos($answer['error'], 'settlement-is-posted') !== FALSE) {
+            return array('ok' => FALSE, 'retryable' => FALSE,
+                         'error' => 'shares-gone-but-settlement-is-posted: ' . $rilvenId);
+        }
+        return array('ok' => FALSE, 'error' => $answer['error'], 'retryable' => $answer['retryable']);
+    }
+
+    // -----------------------------------------------------------------------
     // the mapping
     // -----------------------------------------------------------------------
 
@@ -237,7 +309,7 @@ class Rilven_financing
         }
 
         $item = array(
-            'code'                => (string) $share->id,
+            'code'                => $this->shareCode($share),
             'transactionHelperId' => $helperId,
             'creditTableRowId'    => $patientBranchId,
             'amount'              => $amount,
@@ -407,6 +479,28 @@ class Rilven_financing
     // -----------------------------------------------------------------------
     // small things
     // -----------------------------------------------------------------------
+
+    /**
+     * A line's code: the SERVICE and the FINANCIER, never the payment's own id.
+     *
+     * Sales_model deletes every accruing row of a case and re-inserts them on each edit, so
+     * `sma_payments.id` is a different number after every save. Keyed on it, each line would
+     * read as a new line for ever: the old one deleted, a new one created, and the
+     * transaction_id tying it to the ledger thrown away with it. `sale_item_id` survives -- the
+     * delete of sale_items is commented out in that same model.
+     *
+     * A share with no service line at all falls back to the case, so the code is still stable
+     * and still unique within the document.
+     */
+    private function shareCode($share)
+    {
+        $itemId = (int) (isset($share->sale_item_id) ? $share->sale_item_id : 0);
+        $companyId = (int) (isset($share->company_id) ? $share->company_id : 0);
+        if ($itemId > 0) {
+            return $itemId . '-' . $companyId;
+        }
+        return 'case-' . (int) $share->sale_id . '-' . $companyId;
+    }
 
     /** Whether this payer is the clinic paying for itself rather than somebody owing money. */
     private function isConcession($companyId)

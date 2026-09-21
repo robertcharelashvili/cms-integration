@@ -485,6 +485,8 @@ class Rilven
                 $queued += $this->backfillInsurers($limit);
             } elseif ($entity === 'financing') {
                 $queued += $this->backfillFinancing($limit);
+                // Deliberately NOT given $limit -- see the method.
+                $queued += $this->refreshFinancingByFingerprint();
             } elseif ($entity === 'sale') {
                 $queued += $this->backfillSales($limit);
                 $queued += $this->refreshSales($limit);
@@ -1523,6 +1525,119 @@ class Rilven
      * the patient's alone, and a settlement for one of those would be a document that moves
      * nothing. It is also what closes the queue row cleanly if the shares are removed later.
      */
+    /**
+     * Re-open the settlements whose shares have moved since they were last sent.
+     *
+     * Nothing else would notice. There is no hook: the CMS calls queueSale() from
+     * update_status and from nowhere else, so an edit reaches the case document only through
+     * the sale fingerprint sweep -- and that sweep watches the case header and its service
+     * lines, not the payments. A financier's share can be added, changed or removed with the
+     * case itself untouched, and the settlement would go on saying what it said in September.
+     *
+     * A sweep rather than a hook on purpose. A hook has to be remembered by whoever edits the
+     * clinic's controllers next, and this register writes to the ledger: "somebody forgot a
+     * line" is not an acceptable way for a receivable to stay wrong.
+     *
+     * The digest is over exactly what a settlement line is made of -- the service, the payer and
+     * the amount. Not the payment's id, which changes on every save of the case whether anything
+     * moved or not, and would re-send all hundred and forty-seven documents every time anybody
+     * touched one.
+     */
+    public function refreshFinancingByFingerprint($limit = 0)
+    {
+        if (!$this->financing->enabled()) {
+            return 0;
+        }
+
+        try {
+            $this->CI->db->query('SET SESSION group_concat_max_len = 1000000');
+        } catch (Exception $e) {
+            log_message('error', 'rilven: cannot raise group_concat_max_len, '
+                . 'skipping the financing sweep: ' . $e->getMessage());
+            return 0;
+        }
+
+        $rows = $this->financingFingerprints($limit, NULL);
+        if ($rows === NULL) {
+            return 0;
+        }
+
+        $queued = 0;
+        foreach ($rows as $row) {
+            if ($row->source_fingerprint === NULL || $row->source_fingerprint === '') {
+                // First sight of this case's shares. Adopt, do not re-send: everything already
+                // there was sent from exactly this data a moment ago.
+                $this->CI->db->where('id', $row->outbox_id)
+                             ->update('rilven_outbox', array('source_fingerprint' => $row->fingerprint));
+                continue;
+            }
+            if ($row->source_fingerprint === $row->fingerprint) {
+                continue;
+            }
+            $this->enqueue('financing', $row->id, $this->financing->typeCode());
+            $queued++;
+        }
+        return $queued;
+    }
+
+    /**
+     * What each case's shares look like right now, beside what was last sent.
+     *
+     * Over exactly what a settlement line is made of -- the service, the payer and the amount --
+     * grouped the same way {@see financierShares} groups them, so a split row and a summed one
+     * read alike. NOT over the payment's id: Sales_model deletes and re-inserts every accruing
+     * row on each save, so an id-based digest would differ after a save that changed nothing and
+     * re-send every document in the register.
+     *
+     * @return array|NULL rows, or NULL when the digest cannot be taken at all
+     */
+    private function financingFingerprints($limit, $onlySaleId = NULL)
+    {
+        $prefix   = $this->CI->db->dbprefix;
+        $sales    = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $payments = $prefix . (string) $this->client->cfg('rilven_financing_source_table', 'payments');
+        $source   = $prefix . (string) $this->client->cfg('rilven_source_table', 'companies');
+        $type     = (string) $this->client->cfg('rilven_financing_payment_type', 'accruing');
+
+        $digest = "MD5(COALESCE(GROUP_CONCAT("
+                . " CONCAT_WS(':', p.sale_item_id, p.company_id, p.amount_credit)"
+                . " ORDER BY p.sale_item_id, p.company_id SEPARATOR ','), ''))";
+
+        $this->CI->db
+            ->select('s.id, o.id AS outbox_id, o.source_fingerprint, ' . $digest . ' AS fingerprint', FALSE)
+            ->from($sales . ' s')
+            ->join($prefix . 'rilven_outbox o',
+                   "o.entity = 'financing' AND o.external_id = CAST(s.id AS CHAR)", 'inner', FALSE)
+            ->join($payments . ' p',
+                   "p.sale_id = s.id AND p.type = " . $this->CI->db->escape($type)
+                   . " AND p.amount_credit <> 0", 'left', FALSE)
+            ->join($source . ' c',
+                   'c.id = p.company_id AND '
+                   . $this->whereSql($this->client->cfg('rilven_insurer_where', array()), 'c.'),
+                   'left', FALSE)
+            ->group_by('s.id, o.id, o.source_fingerprint')
+            ->order_by('s.id', 'ASC');
+
+        if ($onlySaleId === NULL) {
+            // Only rows that have landed. A pending one is already going to be sent, and a
+            // given-up one is waiting for a person rather than for another attempt.
+            $this->CI->db->where('o.status', self::SENT);
+        } else {
+            $this->CI->db->where('s.id', $onlySaleId);
+        }
+        if ((int) $limit > 0) {
+            $this->CI->db->limit((int) $limit);
+        }
+        $this->applySaleScope('s.');
+
+        try {
+            return $this->CI->db->get()->result();
+        } catch (Exception $e) {
+            log_message('error', 'rilven: financing fingerprint failed: ' . $e->getMessage());
+            return NULL;
+        }
+    }
+
     public function financingRow($sourceId)
     {
         $table = (string) $this->client->cfg('rilven_sale_source_table', 'sales');
@@ -1555,14 +1670,29 @@ class Rilven
         $payments = (string) $this->client->cfg('rilven_financing_source_table', 'payments');
         $source   = (string) $this->client->cfg('rilven_source_table', 'companies');
 
+        // GROUPED BY SERVICE AND FINANCIER, and summed. Two things force this.
+        //
+        // `sma_payments.id` does not survive an edit: Sales_model deletes every accruing row of
+        // the case and re-inserts them, so the id is new each time. A settlement line keyed on
+        // it would look like a different line after every save -- the old one deleted, a new one
+        // created, and the transaction_id linking it to the ledger lost with it. `sale_item_id`
+        // does survive; the delete of sale_items is commented out in that same model, which is
+        // why the waybill's own lines can be matched by it.
+        //
+        // And the pair is not quite unique on its own: measured over 2025-2026, 27 of 72 172
+        // shares are one financier paying one service line twice -- 150.00 and 242.00 on the
+        // same row. They are the same debt, so they are summed rather than tie-broken with an
+        // ordinal, which would be a second unstable number in the key.
         $this->CI->db
-            ->select('p.*, c.name AS financier_name')
+            ->select('MIN(p.id) AS id, p.sale_id, p.sale_item_id, p.company_id,'
+                   . ' SUM(p.amount_credit) AS amount_credit, c.name AS financier_name', FALSE)
             ->from($payments . ' p')
             ->join($source . ' c', 'c.id = p.company_id', 'inner')
             ->where('p.sale_id', $saleId)
             ->where('p.type', (string) $this->client->cfg('rilven_financing_payment_type', 'accruing'))
             ->where('p.amount_credit <>', 0)
-            ->order_by('p.id', 'ASC');
+            ->group_by(array('p.sale_id', 'p.sale_item_id', 'p.company_id', 'c.name'))
+            ->order_by('p.sale_item_id', 'ASC');
         $this->applyWhere($this->client->cfg('rilven_insurer_where', array()), 'c.');
 
         return $this->CI->db->get()->result();
@@ -2031,11 +2161,17 @@ class Rilven
      */
     private function stampFingerprint($entity, $outboxId, $saleId)
     {
-        if ($entity !== 'sale') {
+        // Both document registers keep one, and for the same reason: their sweep asks "is the
+        // source still what we last sent?", and a fingerprint left stale answers "no" for ever.
+        // The sweep then re-opens the row every minute and the send closes it again -- measured
+        // on the clinic 2026-09-20, three cases and 4 320 requests a day.
+        if ($entity !== 'sale' && $entity !== 'financing') {
             return;
         }
         try {
-            $rows = $this->saleFingerprints(1, (string) $saleId);
+            $rows = $entity === 'financing'
+                ? $this->financingFingerprints(1, (string) $saleId)
+                : $this->saleFingerprints(1, (string) $saleId);
             if (!empty($rows)) {
                 $this->CI->db->where('id', $outboxId)
                      ->update('rilven_outbox', array('source_fingerprint' => $rows[0]->fingerprint));

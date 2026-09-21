@@ -1006,7 +1006,7 @@ $config['rilven_financing_payment_type'] = 'accruing';
 // The two rules, from db/settlement.sql. The clinic's chart: 2854 is Дт1410/Кт1410 and 2855 is
 // Дт8290/Кт1410.
 $config['rilven_financing_helper_share']      = 2854;
-$config['rilven_financing_helper_concession'] = 2855;
+$config['rilven_financing_helper_concession'] = 2855;   // 8220/1410, CIT line 17.3
 
 // The payers that are NOT debtors. `კლინიკის შეღავათი (ლჯ-ის დაფინანსება)` is the clinic paying
 // for itself: nobody owes it, the service was given away, so it is a non-operating expense and
@@ -1015,7 +1015,9 @@ $config['rilven_financing_helper_concession'] = 2855;
 //
 // EMPTY until the accountant names them. An id in the wrong list here writes a real receivable
 // against a company that owes nothing, or hides one that does.
-$config['rilven_financing_concession_ids'] = array();
+$config['rilven_financing_concession_ids'] = array(
+    958,   // კლინიკის შეღავათი (ლჯ-ის დაფინანსება) -- the clinic paying for itself
+);
 
 // Same branch and currency as the case documents, so a settlement and the case it settles never
 // land in different books.
