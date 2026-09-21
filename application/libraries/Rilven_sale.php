@@ -468,7 +468,26 @@ class Rilven_sale
 
         $out['unitPrice'] = $this->money(isset($item->unit_price) ? $item->unit_price : 0);
         $out['subtotal']  = $this->money(isset($item->subtotal) ? $item->subtotal : 0);
-        $out['discount']  = $this->money(isset($item->item_discount) ? $item->item_discount : 0);
+
+        // A NEGATIVE discount is dropped, because it is not a discount.
+        //
+        // Rilven computes `total = subtotal - discount`, so a negative one ADDS to the line. The
+        // CMS does not: for these rows `sma_sales.grand_total` and the accrual both equal the
+        // subtotal, so the CMS treats the field as a note and Rilven treats it as money. Passing
+        // it through makes the document disagree with the case by exactly that amount -- found
+        // on case 76810, where the ledger held 1,510.05 against services of 1,505.05.
+        //
+        // Four lines in four cases over 2025 onward, -190.02 between them. Logged rather than
+        // noted on the row: a note withholds the payload hash so the row is sent again next
+        // tick, and this condition never goes away by itself.
+        $discount = $this->money(isset($item->item_discount) ? $item->item_discount : 0);
+        if ($discount < 0) {
+            log_message('error', 'rilven: item ' . (isset($item->id) ? $item->id : '?')
+                . ' has a negative discount (' . $item->item_discount . '), dropped -- it would'
+                . ' have raised the accrual above the case');
+            $discount = 0;
+        }
+        $out['discount'] = $discount;
         return $out;
     }
 
