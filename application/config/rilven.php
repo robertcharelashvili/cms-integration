@@ -573,14 +573,21 @@ $config['rilven_insurer_person_fields'] = FALSE;
 // account as a patient's, which is what the accrual model needs -- the financier's share moves
 // from the patient to the financier WITHIN 1410.
 $config['rilven_insurer_contragent_type_code'] = 'insurance';
-$config['rilven_insurer_contragent_type_id']   = NULL;
+// Given OUTRIGHT, like the patient's, so the register never asks. Resolving it would need
+// /contragent-type/list-all and /legal-form/filter granted to the integration, and a right
+// nothing else uses only widens what a stolen credential can do. Measured on the clinic
+// 2026-09-21: the insurance type is 2, and so is შპს.
+$config['rilven_insurer_contragent_type_id']   = 2;
 
 // EMPTY ON PURPOSE, and it must stay empty unless somebody knows better. The group holds joint
 // stock insurers, a state programme and municipalities; they have no single legal form, and an
 // empty code sends none at all rather than the wrong one. Left to fall through it would inherit
 // the patient's 'ფპ' and file two hundred organisations as natural persons.
-$config['rilven_insurer_legal_form_code'] = '';
-$config['rilven_insurer_legal_form_id']   = NULL;
+// შპს -- the clinic's answer, 2026-09-21. It was empty before, on the grounds that the group
+// mixes joint-stock insurers, a state programme and municipalities and no single form fits; the
+// clinic would rather they were all the ordinary company form than have none.
+$config['rilven_insurer_legal_form_code'] = 'შპს';
+$config['rilven_insurer_legal_form_id']   = 2;
 
 // 217 of 222 have no usable tax code -- the column holds '-', '1', '123', '1122', and only FIVE
 // are a real nine-digit number. So identity is `code` and the rest get the shared cms-{id}

@@ -76,16 +76,47 @@ class Rilven_insurer extends Rilven_contractor
      */
     protected function cfg($key, $default = NULL)
     {
-        if (strpos($key, 'rilven_') === 0) {
-            $own = 'rilven_insurer_' . substr($key, strlen('rilven_'));
-            $missing = "\0rilven-key-absent\0";
-            $value = $this->client->cfg($own, $missing);
-            if ($value !== $missing) {
-                return $value;
-            }
+        if (strpos($key, 'rilven_') !== 0) {
+            return $this->client->cfg($key, $default);
         }
+
+        $own = 'rilven_insurer_' . substr($key, strlen('rilven_'));
+        $missing = "\0rilven-key-absent\0";
+        $value = $this->client->cfg($own, $missing);
+        if ($value !== $missing) {
+            return $value;
+        }
+
+        // NEVER inherited, whatever the patient register has. These are RESOLVED IDS -- "which
+        // contragent type", "which legal form" -- and they mean "this kind of counterparty's",
+        // so borrowing one is not a shortcut, it is an answer to a different question.
+        //
+        // It is not theoretical: on 2026-09-21 all 221 financiers were created as contragent
+        // type `patient` and legal form 1, ფიზიკური პირი -- two hundred organisations filed as
+        // natural persons, which is the exact accident the empty legal_form_code was there to
+        // prevent. The fall-through defeated it, because `client->cfg` cannot tell a key set to
+        // NULL from a key that is absent: both come back as the default, which was the sentinel.
+        //
+        // So the sentinel is not enough on its own, and these keys say so out loud. NULL here
+        // means "resolve it from my own code", which is what references() does with a null.
+        if (in_array($key, self::NEVER_INHERITED, TRUE)) {
+            return NULL;
+        }
+
         return $this->client->cfg($key, $default);
     }
+
+    /**
+     * Keys whose value is a reference resolved FOR A KIND of counterparty.
+     *
+     * A patient's contragent type is not a financier's, and neither is a patient's legal form.
+     * Inheriting either writes the wrong dimension onto every row this register creates, and an
+     * update can change it afterwards but nothing marks which rows were wrong.
+     */
+    const NEVER_INHERITED = array(
+        'rilven_contragent_type_id',
+        'rilven_legal_form_id',
+    );
 
     /**
      * This register's own corner of sma_rilven_state.
