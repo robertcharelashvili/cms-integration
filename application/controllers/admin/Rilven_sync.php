@@ -155,12 +155,26 @@ class Rilven_sync extends MY_Controller
     /**
      * Close a period: post every document in it that Rilven still holds as a draft.
      *
+     * From the terminal:
+     *
      *     php index.php admin/rilven_sync close 2026-09-01 2026-09-30        counts, calls nothing
      *     php index.php admin/rilven_sync close 2026-09-01 2026-09-30 yes    posts
      *
-     * Dry by default, and the dry run is not a formality -- it is the whole point of having the
-     * command. It prints, leg by leg, what would be posted and which legs are switched off, and
-     * a period closed with a leg switched off is a half-closed period that looks finished.
+     * From the browser, signed in as an owner like every other admin screen:
+     *
+     *     /admin/rilven_sync/close                    the form
+     *     /admin/rilven_sync/close/2026-09-01/2026-09-30   the counts
+     *
+     * **A GET never posts, whatever the URL says.** The browser route confirms only on POST, and
+     * only with the one-shot token the dry run put in the session. CSRF protection is off across
+     * this installation -- `csrf_protection = false` in config.php -- so a link alone is not
+     * enough of a guard: an <img> in an e-mail would be a request this controller honours, and
+     * the request in question writes entries into a closed month. The token also makes the
+     * workflow the right one round: the numbers have to be looked at before they can be posted.
+     *
+     * Dry by default, and the dry run is not a formality -- it is the point of the command. It
+     * shows, leg by leg, what would be posted and which legs are switched off, and a period
+     * closed with a leg switched off is a half-closed period that looks finished.
      *
      * It can run while the cron does -- it only confirms, and never inserts -- with ONE thing
      * worth knowing. An edit arriving for a case just confirmed makes the sale register unpost
@@ -175,6 +189,49 @@ class Rilven_sync extends MY_Controller
      * period Rilven itself has closed refuses even that.
      */
     public function close($from = '', $to = '', $confirm = '')
+    {
+        if (is_cli()) {
+            $this->closeCli($from, $to, $confirm);
+            return;
+        }
+
+        $posting = ($this->input->method(TRUE) === 'POST');
+        if ($posting) {
+            // Only from the form: the segments are ignored on a POST so a crafted URL cannot
+            // widen the period the token was issued for.
+            $from = (string) $this->input->post('from');
+            $to   = (string) $this->input->post('to');
+        } else {
+            $from = $from !== '' ? $from : (string) $this->input->get('from');
+            $to   = $to   !== '' ? $to   : (string) $this->input->get('to');
+        }
+
+        if ($from === '' || $to === '') {
+            $this->closePage(NULL, $from, $to, '');
+            return;
+        }
+
+        $warning = '';
+        if ($posting) {
+            $given  = (string) $this->input->post('token');
+            $issued = (string) $this->session->userdata('rilven_close_token');
+            // One shot. Burned whether it matched or not, so a guessed token cannot be tried
+            // twice and a page left open cannot be submitted a second time by accident.
+            $this->session->unset_userdata('rilven_close_token');
+
+            if ($given === '' || $issued === '' || !hash_equals($issued, $given)) {
+                $posting = FALSE;
+                $warning = 'Ничего не проведено: подтверждение устарело.'
+                         . ' Посмотрите цифры заново и нажмите ещё раз.';
+            }
+        }
+
+        $result = $this->rilven->closePeriod($from, $to, $posting);
+        $this->closePage($result, $from, $to, $warning);
+    }
+
+    /** The terminal form of {@see close}, where "yes" is the whole confirmation. */
+    private function closeCli($from, $to, $confirm)
     {
         if ($from === '' || $to === '') {
             $this->say('A period is two dates:');
@@ -193,7 +250,10 @@ class Rilven_sync extends MY_Controller
         }
 
         $this->say(sprintf('[%s] rilven close %s .. %s -- %s', date('Y-m-d H:i:s'),
-            $result['from'], $result['to'], $posting ? 'POSTING' : 'dry run, nothing was called'));
+            $result['from'], $result['to'],
+            $result['blocked'] !== '' ? 'REFUSED' : ($posting ? 'POSTING' : 'dry run, nothing was called')));
+
+        $this->sayReconciliation($result['reconcile'], $result['blocked']);
 
         $off = array();
         foreach ($result['legs'] as $entity => $leg) {
@@ -223,15 +283,218 @@ class Rilven_sync extends MY_Controller
                      . ' fully closed until every leg is switched on.');
         }
 
-        if (!$posting && $result['drafts'] > 0) {
+        if ($result['stopped'] !== '') {
+            $this->say('    STOPPED: ' . $result['stopped']);
+            $this->say('    The rest of the period was not touched. Safe to run again once the'
+                     . ' reason is gone -- what is posted is not selected a second time.');
+        }
+
+        if ($result['blocked'] !== '') {
+            $this->say('    NOTHING WAS POSTED. Fix the cases above, then run this again.');
+        } elseif (!$posting && $result['drafts'] > 0) {
             $this->say('    To post these: php index.php admin/rilven_sync close '
                      . $result['from'] . ' ' . $result['to'] . ' yes');
         }
+    }
 
-        if (!is_cli()) {
-            $this->output->set_content_type('application/json')
-                         ->set_output(json_encode($result, JSON_UNESCAPED_UNICODE));
+    /** The three-way check, in the terminal. */
+    private function sayReconciliation($check, $blocked)
+    {
+        if ($check === NULL) {
+            return;
         }
+
+        $this->say(sprintf('    reconciliation: %d case(s)  services=%.2f header=%.2f accrual=%.2f',
+            $check['cases'], $check['items'], $check['header'], $check['accrued']));
+
+        if ($blocked === '') {
+            $this->say('    the three agree.');
+            return;
+        }
+
+        $this->say('    DOES NOT RECONCILE: ' . $blocked);
+
+        foreach ($check['rows'] as $row) {
+            $this->say(sprintf('        case %-8s %s  services=%.2f header=%.2f accrual=%.2f',
+                $row->id, substr((string) $row->d, 0, 10),
+                $row->items, $row->header, $row->accrued));
+        }
+        if ($check['orphans'] > 0) {
+            $this->say('        lines outside the item scope, in case(s): '
+                     . implode(', ', $check['orphanCases']));
+        }
+        $this->say('    A case is fixed IN THE CASE, not with an UPDATE.');
+    }
+
+    /**
+     * The browser page: a period, what it holds, and one button.
+     *
+     * Written inline rather than as a theme view. This controller ships as a drop-in library
+     * with no views of its own, and the two installations it runs on are forks of the same
+     * product that have drifted for years -- a view file would have to be placed by hand in
+     * whichever theme each one happens to be using, and would be the thing that breaks when a
+     * theme is changed. A page with no dependencies cannot.
+     */
+    private function closePage($result, $from, $to, $warning)
+    {
+        $token = '';
+        if ($result !== NULL && $result['error'] === '' && $result['blocked'] === ''
+            && !$result['confirmed'] && $result['drafts'] > 0) {
+            // Issued only when there is something to post, so the button and the token appear
+            // and disappear together.
+            $token = bin2hex(random_bytes(16));
+            $this->session->set_userdata('rilven_close_token', $token);
+        }
+
+        $h = function ($value) {
+            return html_escape((string) $value);
+        };
+
+        $action = site_url('admin/rilven_sync/close');
+        $html = '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">'
+              . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+              . '<title>Закрытие периода — Rilven</title><style>'
+              . 'body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:24px;background:#f6f7f9;color:#1f2328}'
+              . '.card{max-width:820px;margin:0 auto 16px;background:#fff;border:1px solid #d8dbdf;'
+              . 'border-radius:8px;padding:20px}'
+              . 'h1{font-size:19px;margin:0 0 4px}.sub{color:#5a6169;margin:0 0 18px}'
+              . 'label{display:inline-block;margin-right:14px}'
+              . 'input[type=date]{font:inherit;padding:6px 8px;border:1px solid #c3c8ce;border-radius:5px}'
+              . 'button{font:inherit;padding:7px 15px;border-radius:5px;border:1px solid #c3c8ce;'
+              . 'background:#fff;cursor:pointer}'
+              . 'button.go{background:#b42318;border-color:#b42318;color:#fff}'
+              . 'table{border-collapse:collapse;width:100%;margin-top:6px}'
+              . 'th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #e6e8ea}'
+              . 'th{font-weight:600;color:#5a6169;font-size:12px;text-transform:uppercase}'
+              . 'td.n{text-align:right;font-variant-numeric:tabular-nums}'
+              . 'tr.total td{font-weight:600;border-top:2px solid #d8dbdf;border-bottom:none}'
+              . '.off{color:#9aa0a6}.bad{color:#b42318}.msg{padding:10px 14px;border-radius:6px;'
+              . 'margin-bottom:16px}.msg.warn{background:#fff4e5;border:1px solid #f0c07a}'
+              . '.msg.done{background:#e7f6ec;border:1px solid #8fce9f}'
+              . '.reasons{margin:4px 0 0 0;padding-left:18px;color:#b42318;font-size:13px}'
+              . '</style></head><body><div class="card">'
+              . '<h1>Закрытие периода</h1>'
+              . '<p class="sub">Проводит в Rilven всё, что за период осталось черновиком.'
+              . ' Сначала показывает, что будет проведено, и ничего не вызывает.</p>';
+
+        if ($warning !== '') {
+            $html .= '<div class="msg warn">' . $h($warning) . '</div>';
+        }
+
+        $html .= '<form method="get" action="' . $h($action) . '">'
+               . '<label>с <input type="date" name="from" value="' . $h($from) . '" required></label>'
+               . '<label>по <input type="date" name="to" value="' . $h($to) . '" required></label>'
+               . '<button type="submit">Посмотреть</button></form>';
+
+        if ($result !== NULL && $result['error'] !== '') {
+            $html .= '<p class="bad">' . $h($result['error']) . '</p>';
+        }
+
+        if ($result !== NULL && $result['error'] === '') {
+            if ($result['confirmed']) {
+                $html .= '<div class="msg done">Проведено: ' . (int) $result['posted']
+                       . '. Не удалось: ' . (int) $result['failed'] . '.</div>';
+            }
+
+            $check = $result['reconcile'];
+            if ($check !== NULL) {
+                $html .= '<h2 style="font-size:15px;margin:22px 0 2px">Сверка периода</h2>'
+                       . '<p class="sub" style="margin:0 0 6px">Услуги случая, его шапка и'
+                       . ' начисление должны говорить одно и то же число.</p>'
+                       . '<table><tr><th>Случаев</th><th class="n">Услуги</th>'
+                       . '<th class="n">Шапка</th><th class="n">Начислено</th></tr>'
+                       . '<tr><td>' . (int) $check['cases'] . '</td>'
+                       . '<td class="n">' . $h(number_format($check['items'], 2, '.', ' ')) . '</td>'
+                       . '<td class="n">' . $h(number_format($check['header'], 2, '.', ' ')) . '</td>'
+                       . '<td class="n">' . $h(number_format($check['accrued'], 2, '.', ' ')) . '</td>'
+                       . '</tr></table>';
+            }
+
+            if ($result['blocked'] !== '') {
+                $html .= '<div class="msg warn" style="margin-top:12px"><b>Период не сходится —'
+                       . ' не проведено ничего.</b><br>' . $h($result['blocked'])
+                       . '<br>Случай правится в самом случае, а не запросом.</div>';
+
+                if ($check !== NULL && $check['rows']) {
+                    $html .= '<table><tr><th>Случай</th><th>Дата</th><th class="n">Услуги</th>'
+                           . '<th class="n">Шапка</th><th class="n">Начислено</th></tr>';
+                    foreach ($check['rows'] as $row) {
+                        $html .= '<tr><td><a href="'
+                               . $h(site_url('admin/sales/view/' . (int) $row->id)) . '">'
+                               . (int) $row->id . '</a></td>'
+                               . '<td>' . $h(substr((string) $row->d, 0, 10)) . '</td>'
+                               . '<td class="n">' . $h(number_format((float) $row->items, 2, '.', ' ')) . '</td>'
+                               . '<td class="n">' . $h(number_format((float) $row->header, 2, '.', ' ')) . '</td>'
+                               . '<td class="n">' . $h(number_format((float) $row->accrued, 2, '.', ' ')) . '</td>'
+                               . '</tr>';
+                    }
+                    $html .= '</table>';
+                }
+
+                if ($check !== NULL && $check['orphans'] > 0) {
+                    $html .= '<p class="bad">Строки вне области услуг, с деньгами — случаи: '
+                           . $h(implode(', ', $check['orphanCases'])) . '</p>';
+                }
+            }
+
+            $html .= '<h2 style="font-size:15px;margin:22px 0 2px">Проводки</h2>'
+                   . '<table><tr><th>Регистр</th><th>Проводка</th><th class="n">Черновиков</th>'
+                   . '<th class="n">Проведено</th><th class="n">Ошибок</th></tr>';
+
+            $off = array();
+            foreach ($result['legs'] as $entity => $leg) {
+                if (!$leg['enabled']) {
+                    $off[] = $entity;
+                    $html .= '<tr class="off"><td>' . $h($entity) . '</td><td>' . $h($leg['pair'])
+                           . '</td><td colspan="3">выключен</td></tr>';
+                    continue;
+                }
+                $html .= '<tr><td>' . $h($entity) . '</td><td>' . $h($leg['pair']) . '</td>'
+                       . '<td class="n">' . (int) $leg['drafts'] . '</td>'
+                       . '<td class="n">' . (int) $leg['posted'] . '</td>'
+                       . '<td class="n">' . (int) $leg['failed'] . '</td></tr>';
+
+                if ($leg['errors']) {
+                    $html .= '<tr><td colspan="5"><ul class="reasons">';
+                    foreach ($leg['errors'] as $reason => $seen) {
+                        $html .= '<li>' . (int) $seen['count'] . ' x ' . $h($reason)
+                               . ' (первый: ' . $h($seen['first']) . ')</li>';
+                    }
+                    $html .= '</ul></td></tr>';
+                }
+            }
+
+            $html .= '<tr class="total"><td colspan="2">Итого</td>'
+                   . '<td class="n">' . (int) $result['drafts'] . '</td>'
+                   . '<td class="n">' . (int) $result['posted'] . '</td>'
+                   . '<td class="n">' . (int) $result['failed'] . '</td></tr></table>';
+
+            if ($result['stopped'] !== '') {
+                $html .= '<div class="msg warn"><b>Остановлено:</b> ' . $h($result['stopped'])
+                       . '<br>Остаток периода не тронут. Когда причина уйдёт, запустите снова —'
+                       . ' проведённое второй раз не выбирается.</div>';
+            }
+
+            if ($off) {
+                $html .= '<div class="msg warn">Не участвовали: ' . $h(implode(', ', $off))
+                       . '. Пока эти регистры выключены, период закрыт не полностью.</div>';
+            }
+
+            if ($token !== '') {
+                $html .= '<form method="post" action="' . $h($action) . '" style="margin-top:18px">'
+                       . '<input type="hidden" name="from" value="' . $h($result['from']) . '">'
+                       . '<input type="hidden" name="to" value="' . $h($result['to']) . '">'
+                       . '<input type="hidden" name="token" value="' . $h($token) . '">'
+                       . '<button type="submit" class="go">Провести ' . (int) $result['drafts']
+                       . ' — отменить будет почти нечем</button></form>';
+            } elseif (!$result['confirmed']) {
+                $html .= '<p class="sub" style="margin:18px 0 0">За этот период проводить нечего.</p>';
+            }
+        }
+
+        $html .= '</div></body></html>';
+
+        $this->output->set_content_type('text/html', 'utf-8')->set_output($html);
     }
 
     /**

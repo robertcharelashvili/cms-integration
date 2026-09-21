@@ -1959,7 +1959,9 @@ class Rilven
         }
         $parts = array();
         foreach ($conditions as $column => $value) {
-            if (is_array($value)) {
+            if ($value === NULL) {
+                $parts[] = $alias . $column . ' IS NULL';
+            } elseif (is_array($value)) {
                 if (empty($value)) {
                     return '1 = 0';
                 }
@@ -2479,6 +2481,112 @@ class Rilven
     }
 
     /**
+     * Do the case's services, its own header and its accrual all say the same number?
+     *
+     * Three records of one amount, written by different parts of the CMS at different moments,
+     * and only the first is the truth: the services are what was done, the header is their
+     * total, the accrual is what the books were told. An edit that reaches one and not the
+     * others leaves a case that looks settled from whichever side you happen to read.
+     *
+     * Measured over the SYNC'S OWN SCOPE, and that is the whole point of doing it here rather
+     * than as a query somebody runs: `rilven_sale_where` picks the cases and
+     * `rilven_sale_item_where` picks the lines, so what this compares is exactly what Rilven
+     * was sent. A reconciliation done on any other footing answers a question nobody asked.
+     *
+     * It reports two different things and they are not the same fault:
+     *
+     *   - `rows`: cases where the three disagree. Something was edited and the edit did not
+     *     reach all three.
+     *   - `orphans`: lines carrying money that the item scope EXCLUDES -- a subservice with a
+     *     subtotal. Those three agree with each other perfectly and are all wrong together,
+     *     because the money is in the case and will never be accrued. One exists in the whole
+     *     of LJ's history, 100,00 on case 70714, and it is a mistake in that case.
+     *
+     * Neither is repaired from here. A case is fixed in the case.
+     */
+    public function reconcilePeriod($from, $to, $limit = 200)
+    {
+        $out = array('cases' => 0, 'items' => 0.0, 'header' => 0.0, 'accrued' => 0.0,
+                     'disagreeing' => 0, 'rows' => array(),
+                     'orphans' => 0, 'orphanSum' => 0.0, 'orphanCases' => array());
+
+        $prefix = $this->CI->db->dbprefix;
+        $sales  = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $items  = $prefix . (string) $this->client->cfg('rilven_sale_item_table', 'sale_items');
+        $pay    = $prefix . (string) $this->client->cfg('rilven_financing_source_table', 'payments');
+        $type   = (string) $this->client->cfg('rilven_financing_payment_type', 'accruing');
+        $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        if ($column === '') {
+            return $out;
+        }
+
+        $saleWhere = $this->whereSql($this->client->cfg('rilven_sale_where', array()), 's.');
+        $itemWhere = $this->whereSql($this->client->cfg('rilven_sale_item_where', array()), 'it.');
+
+        // The sync's own start date belongs in the scope for the same reason the rest of it
+        // does: a case older than the register cannot disagree with a Rilven document that was
+        // never created, and blocking a close over one would make closing impossible for ever.
+        $since = trim((string) $this->client->cfg('rilven_sale_from', ''));
+        $scope = $saleWhere
+               . ' AND DATE(s.' . $column . ') >= ' . $this->CI->db->escape($from)
+               . ' AND DATE(s.' . $column . ') <= ' . $this->CI->db->escape($to)
+               . ($since === '' ? '' : ' AND DATE(s.' . $column . ') >= ' . $this->CI->db->escape($since));
+
+        $figures = 'SELECT s.id, s.' . $column . ' AS d,'
+                 . ' COALESCE((SELECT SUM(it.subtotal) FROM ' . $items . ' it'
+                 . '           WHERE it.sale_id = s.id AND ' . $itemWhere . '), 0) AS items,'
+                 . ' s.grand_total AS header,'
+                 . ' COALESCE((SELECT SUM(p.amount_credit) FROM ' . $pay . ' p'
+                 . '           WHERE p.sale_id = s.id AND p.type = ' . $this->CI->db->escape($type)
+                 . '          ), 0) AS accrued'
+                 . '  FROM ' . $sales . ' s WHERE ' . $scope;
+
+        try {
+            $totals = $this->CI->db->query(
+                'SELECT COUNT(*) AS cases, SUM(t.items) AS items, SUM(t.header) AS header,'
+                . ' SUM(t.accrued) AS accrued,'
+                // ROUND to the money, not to the column: these are DECIMAL(25,4) and a case may
+                // legitimately differ in the fourth place. Two decimals is what the clinic means
+                // by the same number.
+                . ' SUM(ROUND(t.items,2) <> ROUND(t.header,2)'
+                . '      OR ROUND(t.items,2) <> ROUND(t.accrued,2)) AS disagreeing'
+                . ' FROM (' . $figures . ') t')->row();
+
+            if ($totals) {
+                $out['cases']       = (int) $totals->cases;
+                $out['items']       = (float) $totals->items;
+                $out['header']      = (float) $totals->header;
+                $out['accrued']     = (float) $totals->accrued;
+                $out['disagreeing'] = (int) $totals->disagreeing;
+            }
+
+            if ($out['disagreeing'] > 0) {
+                $out['rows'] = $this->CI->db->query(
+                    'SELECT t.* FROM (' . $figures . ') t'
+                    . ' WHERE ROUND(t.items,2) <> ROUND(t.header,2)'
+                    . '    OR ROUND(t.items,2) <> ROUND(t.accrued,2)'
+                    . ' ORDER BY t.d ASC, t.id ASC LIMIT ' . (int) $limit)->result();
+            }
+
+            $orphan = $this->CI->db->query(
+                'SELECT COUNT(*) AS n, SUM(it.subtotal) AS summa,'
+                . ' GROUP_CONCAT(DISTINCT it.sale_id ORDER BY it.sale_id) AS cases'
+                . '  FROM ' . $items . ' it JOIN ' . $sales . ' s ON s.id = it.sale_id'
+                . ' WHERE NOT (' . $itemWhere . ') AND it.subtotal <> 0 AND ' . $scope)->row();
+
+            if ($orphan && (int) $orphan->n > 0) {
+                $out['orphans']     = (int) $orphan->n;
+                $out['orphanSum']   = (float) $orphan->summa;
+                $out['orphanCases'] = explode(',', (string) $orphan->cases);
+            }
+        } catch (Exception $e) {
+            log_message('error', 'rilven: reconcilePeriod failed: ' . $e->getMessage());
+        }
+
+        return $out;
+    }
+
+    /**
      * Post everything in a period that is still sitting in Rilven as a draft.
      *
      * The registers create documents; only the sale and the deposit ever confirm one, and only
@@ -2510,7 +2618,7 @@ class Rilven
     {
         $out = array('from' => $from, 'to' => $to, 'confirmed' => (bool) $confirm,
                      'legs' => array(), 'drafts' => 0, 'posted' => 0, 'failed' => 0,
-                     'error' => '');
+                     'error' => '', 'blocked' => '', 'stopped' => '', 'reconcile' => NULL);
 
         if (!$this->isDate($from) || !$this->isDate($to)) {
             $out['error'] = 'a period is two dates, Y-m-d';
@@ -2520,6 +2628,40 @@ class Rilven
             $out['error'] = 'the period ends before it starts';
             return $out;
         }
+
+        // The period has to agree with itself before any of it is posted.
+        //
+        // Posting is the one step that is hard to take back, and every leg below is built on the
+        // accrual -- the share divides it, the clearing settles it. Post first and reconcile
+        // afterwards and the answer is a ledger that has to be unpicked; reconcile first and the
+        // answer is two case numbers somebody fixes in the cases. Measured on September: 620
+        // cases, and exactly two of them disagree.
+        //
+        // It downgrades the run to a dry one rather than returning early, deliberately. The draft
+        // counts are what say how much work the close is, and refusing to show them would leave
+        // the person with a complaint and no picture.
+        $out['reconcile'] = $this->reconcilePeriod($from, $to);
+        $bad = $out['reconcile'];
+
+        if ($bad['disagreeing'] > 0 || $bad['orphans'] > 0) {
+            $reasons = array();
+            if ($bad['disagreeing'] > 0) {
+                $reasons[] = $bad['disagreeing'] . ' case(s) where the services, the header and the'
+                           . ' accrual do not say the same number';
+            }
+            if ($bad['orphans'] > 0) {
+                $reasons[] = $bad['orphans'] . ' line(s) carrying ' . number_format($bad['orphanSum'], 2, '.', '')
+                           . ' that the item scope excludes, so it is never accrued';
+            }
+            $out['blocked'] = implode('; ', $reasons);
+            $confirm = FALSE;
+            $out['confirmed'] = FALSE;
+        }
+
+        // Counted ACROSS the legs, not within one. A far side that is down refuses the
+        // financier shares exactly as it refuses the accruals, and a counter that reset at each
+        // leg would let it be asked four times over.
+        $consecutive = 0;
 
         foreach ($this->closeLegs() as $entity => $leg) {
             $one = array('pair' => $leg['pair'], 'what' => $leg['what'], 'enabled' => FALSE,
@@ -2538,21 +2680,49 @@ class Rilven
                             $this->CI->db->where('id', $row->outbox_id)
                                          ->update('rilven_outbox', array('rilven_status' => 2));
                             $one['posted']++;
-                        } else {
-                            // Grouped, not listed. One reason refusing four hundred documents is
-                            // one thing to fix; four hundred lines is a wall nobody reads.
-                            $reason = $answer['error'];
-                            if (!isset($one['errors'][$reason])) {
-                                $one['errors'][$reason] = array('count' => 0, 'first' => $row->external_id);
-                            }
-                            $one['errors'][$reason]['count']++;
-                            $one['failed']++;
+                            $consecutive = 0;
+                            continue;
+                        }
+
+                        // Grouped, not listed. One reason refusing four hundred documents is
+                        // one thing to fix; four hundred lines is a wall nobody reads.
+                        $reason = $answer['error'];
+                        if (!isset($one['errors'][$reason])) {
+                            $one['errors'][$reason] = array('count' => 0, 'first' => $row->external_id);
+                        }
+                        $one['errors'][$reason]['count']++;
+                        $one['failed']++;
+                        $consecutive++;
+
+                        // The same two guards push() has, and they are needed more here, not
+                        // less: push() works through a queue that survives being stopped, while
+                        // this walks six hundred documents in one go with nothing to resume
+                        // from. A refused credential refuses every one of them, and a far side
+                        // that is down does not want six hundred more requests to prove it.
+                        if ($this->client->credentialRefused()) {
+                            $out['stopped'] = 'credential refused: ' . $this->client->lastError();
+                            break;
+                        }
+                        if ($consecutive >= self::GIVE_THE_SERVER_A_REST) {
+                            $out['stopped'] = 'stopped after ' . $consecutive
+                                . ' in a row failed for the same outside reason: ' . $reason;
+                            break;
                         }
                     }
                 }
             }
 
             $out['legs'][$entity] = $one;
+
+            if ($out['stopped'] !== '') {
+                break;
+            }
+        }
+
+        // Counted after the loop so a run that stopped early still reports what it did. The legs
+        // it never reached are absent rather than zero, which is the truth.
+        $out['drafts'] = $out['posted'] = $out['failed'] = 0;
+        foreach ($out['legs'] as $one) {
             $out['drafts'] += $one['drafts'];
             $out['posted'] += $one['posted'];
             $out['failed'] += $one['failed'];
