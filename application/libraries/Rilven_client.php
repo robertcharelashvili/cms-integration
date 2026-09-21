@@ -42,6 +42,55 @@ class Rilven_client
     /** Why the last call failed, for a caller that only wants to print it. */
     private $lastError = '';
 
+    /**
+     * What time it is FOR THE CLINIC -- not for whoever ran this, and not for the database.
+     *
+     * There are three clocks on this installation and no two of them agree:
+     *
+     *   Asia/Tbilisi     what `index.php` sets, so the cron and every page write dates in it
+     *   UTC              what PHP falls back to when the CLI is invoked without index.php
+     *   America/New_York what the SERVER and therefore MySQL are set to, eight hours behind
+     *
+     * Every date in this schema is written through PHP, so the DATA is in the clinic's zone.
+     * The comparisons were not, and the damage was the quiet kind. `CURDATE()` answered New
+     * York's date, so between midnight and eight in the morning the ripening cutoff sat a whole
+     * day behind. And `o.updated_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)` measured a Tbilisi
+     * stamp against a New York threshold eight hours in its past, so what should have been a
+     * one-hour guard became a nine-hour one -- measured 2026-09-21, it withheld 20 of the 306
+     * ripe cases, and WHICH 20 moves with the time of day. Not broken enough to notice; wrong
+     * all day long.
+     *
+     * An EXPLICIT zone rather than the database's, which was the previous fix. Taking both
+     * sides off MySQL's clock made them consistent; it did not make them right, because the
+     * data was never on that clock. This is the one the clinic keeps, and it reads the same
+     * whoever runs the script.
+     *
+     * @param  string $modify optional strtotime-style shift, e.g. '-2 days'
+     * @return string 'Y-m-d H:i:s' in the clinic's zone
+     */
+    public function clinicNow($modify = '')
+    {
+        $zone = trim((string) $this->cfg('rilven_source_timezone', 'Asia/Tbilisi'));
+        try {
+            $now = new DateTime('now', new DateTimeZone($zone === '' ? 'Asia/Tbilisi' : $zone));
+        } catch (Exception $e) {
+            // A zone name that PHP does not know must not stop the sync. It falls back to the
+            // ambient clock and says so, which is the old behaviour and no worse than it.
+            log_message('error', 'rilven: unknown timezone ' . $zone . ', using the ambient clock');
+            return $modify === '' ? date('Y-m-d H:i:s') : date('Y-m-d H:i:s', strtotime($modify));
+        }
+        if ($modify !== '') {
+            $now->modify($modify);
+        }
+        return $now->format('Y-m-d H:i:s');
+    }
+
+    /** The clinic's date alone, for comparing against a date column. */
+    public function clinicToday($modify = '')
+    {
+        return substr($this->clinicNow($modify), 0, 10);
+    }
+
     /** Set once a credential has been refused, so a run stops instead of hammering. */
     private $credentialRefused = FALSE;
 

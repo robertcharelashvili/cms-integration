@@ -707,12 +707,17 @@ class Rilven_sale
     }
 
     /**
-     * The newest case date that may be posted today, as the DATABASE reckons it.
+     * The newest case date that may be posted today, ON THE CLINIC'S CLOCK.
      *
-     * Asked of MySQL rather than computed with date() because this process does not agree with
-     * itself about what time it is: the cron's PHP runs in the clinic's zone and an interactive
-     * one in UTC, eight hours apart, and a boundary that moves with whoever ran the script is
-     * not a boundary. The data and the cutoff now come off the same clock.
+     * This asked MySQL, and the reasoning was that the process does not agree with itself about
+     * what time it is -- the cron's PHP runs in the clinic's zone and an interactive one in UTC
+     * -- so both sides should come off one clock. The premise was right and the clock was
+     * wrong. THIS SERVER IS SET TO America/New_York: MySQL was answering eight hours behind the
+     * clinic, while every date in the schema is written by PHP in the clinic's zone. Consistent
+     * and incorrect, which is the worse of the two failures because it looks settled.
+     *
+     * {@see Rilven_client::clinicNow} names the zone outright, so the boundary reads the same
+     * whoever runs the script AND agrees with the data.
      *
      * Resolved once per run.
      */
@@ -721,15 +726,7 @@ class Rilven_sale
         if ($this->postCutoff !== NULL) {
             return $this->postCutoff === FALSE ? NULL : $this->postCutoff;
         }
-        try {
-            $row = $this->CI->db->query(
-                'SELECT DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL ? DAY), \'%Y-%m-%d\') AS d',
-                array($days))->row();
-            $this->postCutoff = $row ? (string) $row->d : FALSE;
-        } catch (Exception $e) {
-            log_message('error', 'rilven: cannot read the posting cutoff: ' . $e->getMessage());
-            $this->postCutoff = FALSE;
-        }
+        $this->postCutoff = $this->client->clinicToday('-' . (int) $days . ' days');
         return $this->postCutoff === FALSE ? NULL : $this->postCutoff;
     }
 

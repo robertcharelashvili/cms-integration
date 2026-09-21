@@ -410,8 +410,9 @@ class Rilven
         }
 
         try {
+            $cutoff = $this->clinicToday('-' . $days . ' days');
             $row = $this->CI->db
-                ->select($column . ' <= DATE_SUB(CURDATE(), INTERVAL ' . $days . ' DAY) AS closed', FALSE)
+                ->select('DATE(' . $column . ') <= ' . $this->CI->db->escape($cutoff) . ' AS closed', FALSE)
                 ->from($table)
                 ->where('id', $saleId)
                 ->limit(1)
@@ -450,6 +451,20 @@ class Rilven
     }
 
     /**
+     * The clinic's clock. Kept on the CLIENT because every register holds one and they all
+     * need the same answer -- see {@see Rilven_client::clinicNow}.
+     */
+    public function clinicNow($modify = '')
+    {
+        return $this->client->clinicNow($modify);
+    }
+
+    public function clinicToday($modify = '')
+    {
+        return $this->client->clinicToday($modify);
+    }
+
+    /**
      * Insert or reopen an outbox entry.
      *
      * ON DUPLICATE KEY rather than select-then-insert: two receptionists saving the same
@@ -460,13 +475,18 @@ class Rilven
      */
     private function enqueue($entity, $sourceId, $typeCode)
     {
+        // The clinic's clock, not the server's. `finish()` writes `updated_at` with PHP and this
+        // wrote it with MySQL, so one column carried two clocks eight hours apart -- and
+        // ripenSales() compares against exactly that column.
+        $stamp = $this->clinicNow();
+
         $sql = 'INSERT INTO ' . $this->CI->db->dbprefix('rilven_outbox')
              . ' (entity, external_id, type_code, status, attempts, created_at)'
-             . ' VALUES (?, ?, ?, ?, 0, NOW())'
-             . ' ON DUPLICATE KEY UPDATE status = ?, last_error = NULL, updated_at = NOW()';
+             . ' VALUES (?, ?, ?, ?, 0, ?)'
+             . ' ON DUPLICATE KEY UPDATE status = ?, last_error = NULL, updated_at = ?';
 
         $this->CI->db->query($sql, array((string) $entity, (string) $sourceId, (string) $typeCode,
-                                          self::PENDING, self::PENDING));
+                                          self::PENDING, $stamp, self::PENDING, $stamp));
         return TRUE;
     }
 
@@ -769,10 +789,12 @@ class Rilven
                 ->where('o.rilven_status IS NULL', NULL, FALSE)
                 ->or_where('o.rilven_status', 1)
             ->group_end()
-            ->where('s.' . $column . ' <= DATE_SUB(CURDATE(), INTERVAL ' . $days . ' DAY)', NULL, FALSE)
+            ->where('DATE(s.' . $column . ') <= '
+                    . $this->CI->db->escape($this->clinicToday('-' . $days . ' days')), NULL, FALSE)
             ->group_start()
                 ->where('o.updated_at IS NULL', NULL, FALSE)
-                ->or_where('o.updated_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)', NULL, FALSE)
+                ->or_where('o.updated_at < ' . $this->CI->db->escape($this->clinicNow('-1 hour')),
+                           NULL, FALSE)
             ->group_end();
 
         $from = trim((string) $this->client->cfg('rilven_sale_from', ''));
