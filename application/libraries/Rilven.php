@@ -2468,15 +2468,27 @@ class Rilven
      */
     private function closeLegs()
     {
+        // `gated` -- whether the three-way reconciliation may stop this leg.
+        //
+        // Three of the four read the CASE: the accrual IS the case's figures, the share divides
+        // them, the clearing settles against them. A case whose services, header and accrual
+        // disagree must not have any of those posted, because whichever number is wrong, one of
+        // these legs is about to write it into the books.
+        //
+        // The receipt reads NONE of them. The patient handed money over, the till holds it, and
+        // Дт1110/Кт3120 says only that -- it is true whatever the case turns out to say, and it
+        // was already true before anybody looked. Holding it back until an unrelated case is
+        // corrected does not make the books safer, it just leaves money out of them. So the
+        // receipt posts, and the other three wait.
         return array(
             'sale'      => array('register' => $this->sale,      'source' => 'sale',
-                                 'pair' => 'Дт1410/Кт6110', 'what' => 'accrual'),
+                                 'pair' => 'Дт1410/Кт6110', 'what' => 'accrual',   'gated' => TRUE),
             'financing' => array('register' => $this->financing, 'source' => 'sale',
-                                 'pair' => 'Дт1410/Кт1410', 'what' => 'financier share'),
+                                 'pair' => 'Дт1410/Кт1410', 'what' => 'financier share', 'gated' => TRUE),
             'deposit'   => array('register' => $this->deposit,   'source' => 'deposit',
-                                 'pair' => 'Дт1110/Кт3120', 'what' => 'receipt'),
+                                 'pair' => 'Дт1110/Кт3120', 'what' => 'receipt',   'gated' => FALSE),
             'clearing'  => array('register' => $this->clearing,  'source' => 'sale',
-                                 'pair' => 'Дт3120/Кт1410', 'what' => 'clearing'),
+                                 'pair' => 'Дт3120/Кт1410', 'what' => 'clearing',  'gated' => TRUE),
         );
     }
 
@@ -2654,8 +2666,6 @@ class Rilven
                            . ' that the item scope excludes, so it is never accrued';
             }
             $out['blocked'] = implode('; ', $reasons);
-            $confirm = FALSE;
-            $out['confirmed'] = FALSE;
         }
 
         // Counted ACROSS the legs, not within one. A far side that is down refuses the
@@ -2665,15 +2675,17 @@ class Rilven
 
         foreach ($this->closeLegs() as $entity => $leg) {
             $one = array('pair' => $leg['pair'], 'what' => $leg['what'], 'enabled' => FALSE,
-                         'drafts' => 0, 'posted' => 0, 'failed' => 0, 'errors' => array());
+                         'held' => FALSE, 'drafts' => 0, 'posted' => 0, 'failed' => 0,
+                         'errors' => array());
 
             $register = $leg['register'];
             if ($register->enabled()) {
                 $one['enabled'] = TRUE;
+                $one['held'] = ($out['blocked'] !== '' && $leg['gated']);
                 $rows = $this->closeDrafts($entity, $leg['source'], $from, $to, $limit);
                 $one['drafts'] = count($rows);
 
-                if ($confirm) {
+                if ($confirm && !$one['held']) {
                     foreach ($rows as $row) {
                         $answer = $register->confirm((int) $row->rilven_id);
                         if ($answer['ok']) {
@@ -2764,25 +2776,27 @@ class Rilven
             ->where('o.status', self::SENT)
             ->where('o.rilven_id > 0', NULL, FALSE);
 
-        // What counts as a draft differs by register, and getting this wrong is expensive in one
-        // direction only.
-        $this->CI->db->group_start();
-        if ($source === 'deposit') {
-            // This register confirms at insert time, and only STARTED reporting the status back
-            // when the close was built. So NULL here does not mean draft -- it means "sent before
-            // anybody asked", and in LJ that is a hundred and fifteen thousand receipts that are
-            // posted and must not be walked. The confirmations that genuinely failed are not lost
-            // with them: that failure is a note, and a note is written to `last_error`.
-            $this->CI->db->where('o.rilven_status', 1)
-                         ->or_where("o.rilven_status IS NULL AND o.last_error LIKE 'not-posted:%'",
-                                    NULL, FALSE);
-        } else {
-            // Everywhere else NULL is a draft, for the reason ripenSales() gives: rows that
-            // landed before the column existed have never been told what Rilven thinks of them.
-            $this->CI->db->where('o.rilven_status IS NULL', NULL, FALSE)
-                         ->or_where('o.rilven_status', 1);
-        }
-        $this->CI->db->group_end();
+        // NULL counts as a draft, for the reason ripenSales() gives: a row that landed before the
+        // column was reported has never been told what Rilven thinks of it.
+        //
+        // The deposit register had an exception here and it was WRONG. The argument was that this
+        // register confirms at insert time, so NULL means "posted, just never recorded", and that
+        // walking them would mean a hundred and fifteen thousand pointless calls. Both halves
+        // were mistaken. The number is the size of `sma_deposits`, not of this queue -- the
+        // outbox only ever holds what the register actually queued, which `rilven_deposit_from`
+        // bounds to 563 rows. And "the insert path confirms" is an assumption, not a fact: 273
+        // receipts sent during the manual-cron race of 2026-09-20 are sitting in Rilven as drafts
+        // with no entry behind them, money in the till and nothing in the books, and the
+        // exception made every one of them invisible to the close.
+        //
+        // Re-confirming something already confirmed costs one no-op: CashFlowController's
+        // update-status compares the status first and does nothing when it already matches. Once
+        // it has run, `rilven_status` is stamped and the row is never selected again. A wasted
+        // call that happens once is worth less than a receipt nobody posts.
+        $this->CI->db->group_start()
+            ->where('o.rilven_status IS NULL', NULL, FALSE)
+            ->or_where('o.rilven_status', 1)
+        ->group_end();
 
         $this->CI->db
             // DATE() so a column that carries a time does not drop the last day of the period.

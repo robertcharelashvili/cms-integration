@@ -263,9 +263,10 @@ class Rilven_sync extends MY_Controller
                     $entity, $leg['pair'], $leg['what']));
                 continue;
             }
-            $this->say(sprintf('    %-10s %-12s %-16s drafts=%d posted=%d failed=%d',
+            $this->say(sprintf('    %-10s %-12s %-16s drafts=%d posted=%d failed=%d%s',
                 $entity, $leg['pair'], $leg['what'],
-                $leg['drafts'], $leg['posted'], $leg['failed']));
+                $leg['drafts'], $leg['posted'], $leg['failed'],
+                $leg['held'] ? '  HELD: the period does not reconcile' : ''));
 
             foreach ($leg['errors'] as $reason => $seen) {
                 $this->say(sprintf('        %5d x %s (first: %s)',
@@ -290,8 +291,11 @@ class Rilven_sync extends MY_Controller
         }
 
         if ($result['blocked'] !== '') {
-            $this->say('    NOTHING WAS POSTED. Fix the cases above, then run this again.');
-        } elseif (!$posting && $result['drafts'] > 0) {
+            $this->say('    The legs that read the case were HELD. The receipt was not: the money'
+                     . ' arrived whatever the case says. Fix the cases above and run this again.');
+        }
+
+        if (!$posting && $result['drafts'] > 0) {
             $this->say('    To post these: php index.php admin/rilven_sync close '
                      . $result['from'] . ' ' . $result['to'] . ' yes');
         }
@@ -338,8 +342,13 @@ class Rilven_sync extends MY_Controller
     private function closePage($result, $from, $to, $warning)
     {
         $token = '';
-        if ($result !== NULL && $result['error'] === '' && $result['blocked'] === ''
-            && !$result['confirmed'] && $result['drafts'] > 0) {
+        $free = 0;
+        if ($result !== NULL && $result['error'] === '') {
+            foreach ($result['legs'] as $leg) {
+                if (!$leg['held']) { $free += $leg['drafts']; }
+            }
+        }
+        if ($result !== NULL && $result['error'] === '' && !$result['confirmed'] && $free > 0) {
             // Issued only when there is something to post, so the button and the token appear
             // and disappear together.
             $token = bin2hex(random_bytes(16));
@@ -411,8 +420,11 @@ class Rilven_sync extends MY_Controller
             }
 
             if ($result['blocked'] !== '') {
-                $html .= '<div class="msg warn" style="margin-top:12px"><b>Период не сходится —'
-                       . ' не проведено ничего.</b><br>' . $h($result['blocked'])
+                $html .= '<div class="msg warn" style="margin-top:12px"><b>Период не сходится.</b>'
+                       . '<br>' . $h($result['blocked'])
+                       . '<br>Удержаны проводки, которые читают случай — начисление, доля'
+                       . ' финансиста, зачёт. Приход денег не удержан: деньги пришли независимо'
+                       . ' от того, что говорит случай.'
                        . '<br>Случай правится в самом случае, а не запросом.</div>';
 
                 if ($check !== NULL && $check['rows']) {
@@ -449,9 +461,10 @@ class Rilven_sync extends MY_Controller
                            . '</td><td colspan="3">выключен</td></tr>';
                     continue;
                 }
-                $html .= '<tr><td>' . $h($entity) . '</td><td>' . $h($leg['pair']) . '</td>'
+                $html .= '<tr' . ($leg['held'] ? ' class="off"' : '') . '><td>' . $h($entity)
+                       . '</td><td>' . $h($leg['pair']) . '</td>'
                        . '<td class="n">' . (int) $leg['drafts'] . '</td>'
-                       . '<td class="n">' . (int) $leg['posted'] . '</td>'
+                       . '<td class="n">' . ($leg['held'] ? 'удержано' : (int) $leg['posted']) . '</td>'
                        . '<td class="n">' . (int) $leg['failed'] . '</td></tr>';
 
                 if ($leg['errors']) {
@@ -485,7 +498,7 @@ class Rilven_sync extends MY_Controller
                        . '<input type="hidden" name="from" value="' . $h($result['from']) . '">'
                        . '<input type="hidden" name="to" value="' . $h($result['to']) . '">'
                        . '<input type="hidden" name="token" value="' . $h($token) . '">'
-                       . '<button type="submit" class="go">Провести ' . (int) $result['drafts']
+                       . '<button type="submit" class="go">Провести ' . (int) $free
                        . ' — отменить будет почти нечем</button></form>';
             } elseif (!$result['confirmed']) {
                 $html .= '<p class="sub" style="margin:18px 0 0">За этот период проводить нечего.</p>';
