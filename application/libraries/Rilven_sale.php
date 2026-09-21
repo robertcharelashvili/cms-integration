@@ -1247,8 +1247,21 @@ class Rilven_sale
      */
     private function looksPosted($error)
     {
-        return strpos($error, 'status') !== FALSE || strpos($error, 'confirmed') !== FALSE
-            || strpos($error, 'not-editable') !== FALSE;
+        // The real keys, read off the API rather than guessed. Rilven refuses to change a
+        // document that is not a draft, and says so in one of two families:
+        //
+        //   waybill-is-not-updatable      WaybillController, thrown exactly on `status != 1`
+        //   document-is-not-editable      the same refusal from the document builder
+        //   cash-flow-is-not-updatable    the other registers, same rule
+        //
+        // `not-updatable` was MISSING, so the one refusal this whole path exists to handle went
+        // unrecognised: case 76810 was re-sent after a correction, answered
+        // `waybill-is-not-updatable`, and was given up instead of being unposted and rewritten.
+        // The guard was watching for the words and not for the answer.
+        return strpos($error, 'not-updatable') !== FALSE
+            || strpos($error, 'not-editable') !== FALSE
+            || strpos($error, 'confirmed') !== FALSE
+            || strpos($error, 'status') !== FALSE;
     }
 
     // -----------------------------------------------------------------------
