@@ -56,6 +56,9 @@ class Rilven
     /** @var Rilven_deposit */
     private $deposit;
 
+    /** @var Rilven_financing */
+    private $financing;
+
     /** Reasons rows were refused in this run, for the caller to print. */
     public $refusals = array();
 
@@ -73,6 +76,7 @@ class Rilven
         $this->CI->load->library('rilven_sale');
         $this->CI->load->library('rilven_cash');
         $this->CI->load->library('rilven_deposit');
+        $this->CI->load->library('rilven_financing');
         $this->client     = $this->CI->rilven_client;
         $this->contractor = $this->CI->rilven_contractor;
         $this->insurer    = $this->CI->rilven_insurer;
@@ -81,6 +85,7 @@ class Rilven
         $this->sale       = $this->CI->rilven_sale;
         $this->cash       = $this->CI->rilven_cash;
         $this->deposit    = $this->CI->rilven_deposit;
+        $this->financing  = $this->CI->rilven_financing;
         $this->CI->load->database();
     }
 
@@ -97,6 +102,11 @@ class Rilven
     public function insurer()
     {
         return $this->insurer;
+    }
+
+    public function financing()
+    {
+        return $this->financing;
     }
 
     public function category()
@@ -156,7 +166,7 @@ class Rilven
         $names = array();
         foreach (array($this->cash, $this->category, $this->service,
                        $this->contractor, $this->insurer, $this->sale,
-                       $this->deposit) as $register) {
+                       $this->financing, $this->deposit) as $register) {
             $names[] = $register->entity();
         }
         return $names;
@@ -172,8 +182,10 @@ class Rilven
         // came from, and it is refused until each has travelled.
         // Financiers sit beside patients and before the documents, for the same reason
         // patients do: a case that names one is refused until it has travelled.
+        // Financing goes AFTER sale and before deposits: a settlement names the case's
+        // document, and a case that has not travelled yet has no document to name.
         $all = array($this->cash, $this->category, $this->service, $this->contractor,
-                     $this->insurer, $this->sale, $this->deposit);
+                     $this->insurer, $this->sale, $this->financing, $this->deposit);
 
         $enabled = array();
         foreach ($all as $register) {
@@ -471,6 +483,8 @@ class Rilven
                 $queued += $this->backfillServices($limit);
             } elseif ($entity === 'insurer') {
                 $queued += $this->backfillInsurers($limit);
+            } elseif ($entity === 'financing') {
+                $queued += $this->backfillFinancing($limit);
             } elseif ($entity === 'sale') {
                 $queued += $this->backfillSales($limit);
                 $queued += $this->refreshSales($limit);
@@ -1325,6 +1339,9 @@ class Rilven
         if ($entity === 'insurer') {
             return $this->insurerRow($sourceId);
         }
+        if ($entity === 'financing') {
+            return $this->financingRow($sourceId);
+        }
         if ($entity === 'category') {
             return $this->categoryRow($sourceId);
         }
@@ -1495,6 +1512,152 @@ class Rilven
      * the route that answers "which branches has this contractor" is not granted to the service
      * account. The outbox recorded them at creation for exactly this kind of reason.
      */
+    /**
+     * One case, with the shares somebody OTHER than the patient is paying.
+     *
+     * The case itself comes from the same scope the sale register uses -- so a settlement can
+     * never exist for a case that was never sent -- and the shares are the accruing payment rows
+     * naming a company in the financier group.
+     *
+     * Answers NULL when there are no shares. That is not an error and not a gap: most cases are
+     * the patient's alone, and a settlement for one of those would be a document that moves
+     * nothing. It is also what closes the queue row cleanly if the shares are removed later.
+     */
+    public function financingRow($sourceId)
+    {
+        $table = (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $this->CI->db->from($table . ' s')->select('s.*')->where('s.id', $sourceId);
+        $this->applySaleScope('s.');
+        $row = $this->CI->db->get()->row();
+        if (!$row) {
+            return NULL;
+        }
+
+        $row->shares = $this->financierShares($row->id);
+        if (empty($row->shares)) {
+            return NULL;
+        }
+
+        $this->attachPatientIds($row);
+        return $row;
+    }
+
+    /**
+     * The accruing rows of one case that name a financier.
+     *
+     * `company_id` into the financier group, NOT `insurance_group_id` -- that column is NULL in
+     * every row of this database, and reading it was the first wrong turn taken here. The
+     * financier's name comes along for the comment, so a person reading the settlement in Rilven
+     * sees who it is about without another lookup.
+     */
+    private function financierShares($saleId)
+    {
+        $payments = (string) $this->client->cfg('rilven_financing_source_table', 'payments');
+        $source   = (string) $this->client->cfg('rilven_source_table', 'companies');
+
+        $this->CI->db
+            ->select('p.*, c.name AS financier_name')
+            ->from($payments . ' p')
+            ->join($source . ' c', 'c.id = p.company_id', 'inner')
+            ->where('p.sale_id', $saleId)
+            ->where('p.type', (string) $this->client->cfg('rilven_financing_payment_type', 'accruing'))
+            ->where('p.amount_credit <>', 0)
+            ->order_by('p.id', 'ASC');
+        $this->applyWhere($this->client->cfg('rilven_insurer_where', array()), 'c.');
+
+        return $this->CI->db->get()->result();
+    }
+
+    /**
+     * Queue the cases with a financier share that the outbox has never heard of.
+     *
+     * Bounded by the sale scope, so this can never run ahead of the register whose documents it
+     * depends on: a case outside that scope has no document in Rilven, and a settlement naming
+     * one would be refused anyway.
+     */
+    public function backfillFinancing($limit = 2000)
+    {
+        $prefix   = $this->CI->db->dbprefix;
+        $sales    = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $payments = $prefix . (string) $this->client->cfg('rilven_financing_source_table', 'payments');
+        $source   = $prefix . (string) $this->client->cfg('rilven_source_table', 'companies');
+        $type     = (string) $this->client->cfg('rilven_financing_payment_type', 'accruing');
+
+        $this->CI->db->select('s.id')->from($sales . ' s')->order_by('s.id', 'ASC')->limit((int) $limit);
+        $this->applySaleScope('s.');
+
+        // CAST for the reason spelled out in backfillContractors: comparing an INT id against a
+        // VARCHAR external_id converts the COLUMN and puts the unique key out of reach.
+        $this->CI->db->where('NOT EXISTS (SELECT 1 FROM ' . $prefix . 'rilven_outbox o'
+            . " WHERE o.entity = 'financing' AND o.external_id = CAST(s.id AS CHAR))", NULL, FALSE);
+
+        // Only cases that actually have a share to move.
+        $this->CI->db->where('EXISTS (SELECT 1 FROM ' . $payments . ' p'
+            . ' JOIN ' . $source . ' c ON c.id = p.company_id'
+            . ' WHERE p.sale_id = s.id AND p.type = ' . $this->CI->db->escape($type)
+            . ' AND p.amount_credit <> 0'
+            . ' AND ' . $this->whereSql($this->client->cfg('rilven_insurer_where', array()), 'c.') . ')',
+            NULL, FALSE);
+
+        $queued = 0;
+        foreach ($this->CI->db->get()->result() as $row) {
+            $this->enqueue('financing', $row->id, $this->financing->typeCode());
+            $queued++;
+        }
+        return $queued;
+    }
+
+    /**
+     * A config `where` map as a raw SQL fragment, for use inside an EXISTS.
+     *
+     * The query builder cannot reach into a subquery, and building the fragment by hand is how
+     * a scope written once in the config stays written once. Values go through escape(); an
+     * empty map answers `1 = 1` rather than nothing, because an empty condition inside an AND
+     * is a syntax error and an empty SCOPE means "everything".
+     */
+    private function whereSql($conditions, $alias)
+    {
+        if (!is_array($conditions) || empty($conditions)) {
+            return '1 = 1';
+        }
+        $parts = array();
+        foreach ($conditions as $column => $value) {
+            if (is_array($value)) {
+                if (empty($value)) {
+                    return '1 = 0';
+                }
+                $escaped = array();
+                foreach ($value as $one) {
+                    $escaped[] = $this->CI->db->escape($one);
+                }
+                $parts[] = $alias . $column . ' IN (' . implode(', ', $escaped) . ')';
+            } else {
+                $parts[] = $alias . $column . ' = ' . $this->CI->db->escape($value);
+            }
+        }
+        return implode(' AND ', $parts);
+    }
+
+    /**
+     * Hook for the CMS: a payment was taken or changed, so the case's shares may have moved.
+     *
+     * Called with sma_payments.sale_id. Never throws: a failure to queue must not become a
+     * failure to save the payment.
+     */
+    public function queueFinancing($saleId)
+    {
+        try {
+            $row = $this->financingRow($saleId);
+            if (!$row) {
+                return FALSE;
+            }
+            return $this->enqueue('financing', $row->id, $this->financing->typeCode());
+        } catch (Exception $e) {
+            log_message('error', 'rilven: queueFinancing failed for ' . $saleId . ': ' . $e->getMessage());
+            return FALSE;
+        }
+    }
+
     public function saleRow($sourceId)
     {
         $table = (string) $this->client->cfg('rilven_sale_source_table', 'sales');

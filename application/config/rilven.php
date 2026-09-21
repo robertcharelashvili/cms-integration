@@ -977,3 +977,50 @@ $config['rilven_deposit_company_branch_id'] = 30;
 $config['rilven_deposit_currency_id']       = 44;
 $config['rilven_deposit_code_prefix']       = '';
 
+
+// ---------------------------------------------------------------------------
+// FINANCIER SHARES -- the settlement that moves a case's receivable
+// ---------------------------------------------------------------------------
+//
+// The case's own document accrues the WHOLE of it against the patient. Most of the money is owed
+// by somebody else, and this register moves it: one settlement per case (Rilven document_type
+// 81), one line per share, Дт1410 financier / Кт1410 patient. Measured September 2026 -- patients
+// 291 995, financiers 350 809. Without it fifty-five per cent of the turnover sits on people who
+// do not owe it.
+//
+// OFF until the settlements have been watched for a while. Deliberately not tied to
+// rilven_sale_enabled: the cases can run for weeks before anybody is ready for this.
+$config['rilven_financing_enabled'] = FALSE;
+
+// Where the share lives, and it is not where the column names suggest. `insurance_group_id` is
+// NULL in every row of this database; the financier is `company_id` pointing into the financier
+// group, on an `accruing` row. The case-level row with no sale_item_id is the PATIENT's share and
+// is not sent -- the case document already accrued it.
+$config['rilven_financing_source_table'] = 'payments';
+$config['rilven_financing_payment_type'] = 'accruing';
+
+// Who counts as a financier: the same scope as the insurer register, so the two can never
+// disagree about it. Written once, read twice.
+//   -- see rilven_insurer_where above
+
+// The two rules, from db/settlement.sql. The clinic's chart: 2854 is Дт1410/Кт1410 and 2855 is
+// Дт8290/Кт1410.
+$config['rilven_financing_helper_share']      = 2854;
+$config['rilven_financing_helper_concession'] = 2855;
+
+// The payers that are NOT debtors. `კლინიკის შეღავათი (ლჯ-ის დაფინანსება)` is the clinic paying
+// for itself: nobody owes it, the service was given away, so it is a non-operating expense and
+// taxed as one -- 8290/1410 rather than 1410/1410, and the debit side is a company branch
+// instead of a counterparty.
+//
+// EMPTY until the accountant names them. An id in the wrong list here writes a real receivable
+// against a company that owes nothing, or hides one that does.
+$config['rilven_financing_concession_ids'] = array();
+
+// Same branch and currency as the case documents, so a settlement and the case it settles never
+// land in different books.
+$config['rilven_financing_company_branch_id'] = 30;
+$config['rilven_financing_currency_id']       = 44;
+
+$config['rilven_financing_code_prefix'] = '';
+
