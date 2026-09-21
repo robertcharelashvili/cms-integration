@@ -2437,6 +2437,212 @@ class Rilven
      *
      * @param string|NULL $entity one register, or NULL for every one of them
      */
+    // -----------------------------------------------------------------------
+    // closing a period
+    // -----------------------------------------------------------------------
+
+    /**
+     * The four legs of a closed period, IN THE ONLY ORDER THAT WORKS.
+     *
+     * The clinic's auditor named the pairs; the order is this library's, and it is not the order
+     * they were named in. Balances do not care what sequence entries arrive in, but REFUSALS do,
+     * and each leg here can be refused for want of the one before it:
+     *
+     *   sale       Дт1410 / Кт6110  the accrual. Everything else moves or settles the receivable
+     *                               this leg creates, so nothing can precede it.
+     *   financing  Дт1410 / Кт1410  the financier's share, moved off the patient. It divides the
+     *                               receivable, so the receivable has to be there.
+     *   deposit    Дт1110 / Кт3120  the money, on advances received. Independent of the three,
+     *                               placed here because the leg after it consumes what it puts
+     *                               on 3120, and an advance ought to exist before it is spent.
+     *   clearing   Дт3120 / Кт1410  the advance against the debt. Last: it needs both.
+     *
+     * The settlement ceiling ties the middle two together. A case's lines may not settle more
+     * than that case's services cost, and the financier's share has already taken part of that
+     * room -- so a patient who paid more than their own share makes THIS leg refuse, with
+     * `service-ceiling-exceeded`, and the overpayment is named instead of being posted. That is
+     * why the share goes first: it is contractual, the payment is not, and the leg that should
+     * survive the collision is the one the contract fixes.
+     */
+    private function closeLegs()
+    {
+        return array(
+            'sale'      => array('register' => $this->sale,      'source' => 'sale',
+                                 'pair' => 'Дт1410/Кт6110', 'what' => 'accrual'),
+            'financing' => array('register' => $this->financing, 'source' => 'sale',
+                                 'pair' => 'Дт1410/Кт1410', 'what' => 'financier share'),
+            'deposit'   => array('register' => $this->deposit,   'source' => 'deposit',
+                                 'pair' => 'Дт1110/Кт3120', 'what' => 'receipt'),
+            'clearing'  => array('register' => $this->clearing,  'source' => 'sale',
+                                 'pair' => 'Дт3120/Кт1410', 'what' => 'clearing'),
+        );
+    }
+
+    /**
+     * Post everything in a period that is still sitting in Rilven as a draft.
+     *
+     * The registers create documents; only the sale and the deposit ever confirm one, and only
+     * at the moment it travels. A case sent while the doctor was still writing it lands as a
+     * draft and stays one. A settlement NEVER confirms itself. So the books are complete only
+     * once somebody says a period is done -- which is what this is, and it is deliberately a
+     * separate command rather than something the cron decides.
+     *
+     * It confirms; it does not re-send. The close has no payload in hand and must not build
+     * one: a case edited since it travelled would be quietly rewritten by an operation the
+     * clinic asked to be a posting and nothing else. What is in Rilven is what gets posted, and
+     * a period whose documents are stale wants {@see refreshSalesByFingerprint} first -- which
+     * is the cron's job and will already have run.
+     *
+     * DRY BY DEFAULT. `$confirm` has to be given, because this writes entries into a period the
+     * clinic is about to call closed, and reversing them one at a time is a worse afternoon than
+     * reading a count first.
+     *
+     * Idempotent: a document already at status 2 is not selected, so running it twice over the
+     * same period does nothing the second time. Safe to re-run after fixing whatever refused.
+     *
+     * @param  string $from    inclusive, Y-m-d
+     * @param  string $to      inclusive, Y-m-d
+     * @param  bool   $confirm FALSE counts what would be posted and calls nothing
+     * @param  int    $limit   0 for no limit, per leg
+     * @return array
+     */
+    public function closePeriod($from, $to, $confirm = FALSE, $limit = 0)
+    {
+        $out = array('from' => $from, 'to' => $to, 'confirmed' => (bool) $confirm,
+                     'legs' => array(), 'drafts' => 0, 'posted' => 0, 'failed' => 0,
+                     'error' => '');
+
+        if (!$this->isDate($from) || !$this->isDate($to)) {
+            $out['error'] = 'a period is two dates, Y-m-d';
+            return $out;
+        }
+        if ($from > $to) {
+            $out['error'] = 'the period ends before it starts';
+            return $out;
+        }
+
+        foreach ($this->closeLegs() as $entity => $leg) {
+            $one = array('pair' => $leg['pair'], 'what' => $leg['what'], 'enabled' => FALSE,
+                         'drafts' => 0, 'posted' => 0, 'failed' => 0, 'errors' => array());
+
+            $register = $leg['register'];
+            if ($register->enabled()) {
+                $one['enabled'] = TRUE;
+                $rows = $this->closeDrafts($entity, $leg['source'], $from, $to, $limit);
+                $one['drafts'] = count($rows);
+
+                if ($confirm) {
+                    foreach ($rows as $row) {
+                        $answer = $register->confirm((int) $row->rilven_id);
+                        if ($answer['ok']) {
+                            $this->CI->db->where('id', $row->outbox_id)
+                                         ->update('rilven_outbox', array('rilven_status' => 2));
+                            $one['posted']++;
+                        } else {
+                            // Grouped, not listed. One reason refusing four hundred documents is
+                            // one thing to fix; four hundred lines is a wall nobody reads.
+                            $reason = $answer['error'];
+                            if (!isset($one['errors'][$reason])) {
+                                $one['errors'][$reason] = array('count' => 0, 'first' => $row->external_id);
+                            }
+                            $one['errors'][$reason]['count']++;
+                            $one['failed']++;
+                        }
+                    }
+                }
+            }
+
+            $out['legs'][$entity] = $one;
+            $out['drafts'] += $one['drafts'];
+            $out['posted'] += $one['posted'];
+            $out['failed'] += $one['failed'];
+        }
+
+        return $out;
+    }
+
+    /**
+     * The documents of one register that are in this period and are still drafts.
+     *
+     * `rilven_status` NULL counts as a draft for the reason {@see ripenSales} gives: rows that
+     * landed before the column existed have never been told what Rilven thinks of them.
+     *
+     * The period is judged by the SOURCE row's date and never by the outbox's own timestamps. A
+     * case sent late, resent, or corrected last week still belongs to the month it happened in,
+     * and closing September must not depend on when the queue got round to it.
+     */
+    private function closeDrafts($entity, $source, $from, $to, $limit)
+    {
+        $prefix = $this->CI->db->dbprefix;
+
+        if ($source === 'deposit') {
+            $table  = $prefix . (string) $this->client->cfg('rilven_deposit_source_table', 'deposits');
+            $column = (string) $this->client->cfg('rilven_deposit_date_column', 'date');
+        } else {
+            $table  = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+            $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        }
+        if ($column === '') {
+            return array();
+        }
+
+        $this->CI->db
+            ->select('o.id AS outbox_id, o.external_id, o.rilven_id', FALSE)
+            ->from($prefix . 'rilven_outbox o')
+            ->join($table . ' src', 'src.id = CAST(o.external_id AS UNSIGNED)', 'inner', FALSE)
+            ->where('o.entity', $entity)
+            ->where('o.status', self::SENT)
+            ->where('o.rilven_id > 0', NULL, FALSE);
+
+        // What counts as a draft differs by register, and getting this wrong is expensive in one
+        // direction only.
+        $this->CI->db->group_start();
+        if ($source === 'deposit') {
+            // This register confirms at insert time, and only STARTED reporting the status back
+            // when the close was built. So NULL here does not mean draft -- it means "sent before
+            // anybody asked", and in LJ that is a hundred and fifteen thousand receipts that are
+            // posted and must not be walked. The confirmations that genuinely failed are not lost
+            // with them: that failure is a note, and a note is written to `last_error`.
+            $this->CI->db->where('o.rilven_status', 1)
+                         ->or_where("o.rilven_status IS NULL AND o.last_error LIKE 'not-posted:%'",
+                                    NULL, FALSE);
+        } else {
+            // Everywhere else NULL is a draft, for the reason ripenSales() gives: rows that
+            // landed before the column existed have never been told what Rilven thinks of them.
+            $this->CI->db->where('o.rilven_status IS NULL', NULL, FALSE)
+                         ->or_where('o.rilven_status', 1);
+        }
+        $this->CI->db->group_end();
+
+        $this->CI->db
+            // DATE() so a column that carries a time does not drop the last day of the period.
+            ->where('DATE(src.' . $column . ') >=', $from)
+            ->where('DATE(src.' . $column . ') <=', $to)
+            ->order_by('src.' . $column . ' ASC, src.id ASC', '', FALSE);
+
+        if ((int) $limit > 0) {
+            $this->CI->db->limit((int) $limit);
+        }
+
+        try {
+            return $this->CI->db->get()->result();
+        } catch (Exception $e) {
+            log_message('error', 'rilven: closeDrafts(' . $entity . ') failed: ' . $e->getMessage());
+            return array();
+        }
+    }
+
+    /** A real Y-m-d, and not merely something that looks like one: 2026-02-31 is not a date. */
+    private function isDate($value)
+    {
+        $value = trim((string) $value);
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+            return FALSE;
+        }
+        $parts = explode('-', $value);
+        return checkdate((int) $parts[1], (int) $parts[2], (int) $parts[0]);
+    }
+
     public function retry($includeGivenUp = TRUE, $entity = NULL)
     {
         $statuses = $includeGivenUp ? array(self::FAILED, self::GIVEN_UP) : array(self::FAILED);

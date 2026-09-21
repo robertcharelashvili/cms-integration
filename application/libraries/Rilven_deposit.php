@@ -289,6 +289,12 @@ class Rilven_deposit {
      */
     private function post($result)
     {
+        // Reported to the outbox whatever happens, which this did NOT do before the period close
+        // existed. Nothing had asked: the CMS's edit guard reads the status of a CASE, never of a
+        // receipt, so the column stayed empty here and nobody missed it. The close does ask, and
+        // an empty column would have made it read every receipt ever sent as an unposted draft.
+        $result['rilvenStatus'] = 1;
+
         if (!$this->client->cfg('rilven_deposit_post', TRUE) || (int) $result['id'] <= 0) {
             return $result;
         }
@@ -301,8 +307,39 @@ class Rilven_deposit {
         if (!$answer['ok']) {
             $result['note'] = 'not-posted: ' . $answer['error'];
             $result['noteRetryable'] = $answer['retryable'];
+        } else {
+            $result['rilvenStatus'] = 2;
         }
         return $result;
+    }
+
+    /**
+     * Confirm a receipt that was left as a draft, for the period close.
+     *
+     * {@see post} already confirms at insert time, so in a healthy run this finds nothing. What
+     * it is for is the receipt whose confirmation call failed: that is deliberately a note and
+     * not a refusal, so the document is in Rilven, the money is in the till, and the entry
+     * Дт 1110|1210 / Кт 3120 is missing -- with nothing in the queue to say so, because the row
+     * counts as delivered. The close is where those are found.
+     *
+     * @return array ok, error, retryable
+     */
+    public function confirm($rilvenId)
+    {
+        if ((int) $rilvenId <= 0) {
+            return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
+        }
+
+        $answer = $this->client->put('/cash-flow/update-status', array(
+            'ids'    => array((int) $rilvenId),
+            'status' => 2,
+        ));
+
+        if (!$answer['ok']) {
+            return array('ok' => FALSE, 'error' => $answer['error'],
+                         'retryable' => $answer['retryable']);
+        }
+        return array('ok' => TRUE, 'error' => '', 'retryable' => FALSE);
     }
 
     // -----------------------------------------------------------------------

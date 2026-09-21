@@ -1100,6 +1100,39 @@ class Rilven_sale
     }
 
     /**
+     * Confirm a document that was left as a draft, without re-sending what is in it.
+     *
+     * {@see maybePost} confirms at the moment the case travels, which is right when the case is
+     * ripe by then. A case that was sent while it was still being written is not, so it lands as
+     * a draft and stays one -- and so does a case whose confirmation call failed, because that
+     * failure is recorded as a note rather than a refusal. Both are left for the period close.
+     *
+     * This is the SAME call `maybePost` makes. It is separate only because the close has no
+     * payload in hand and must not build one: re-sending the case would hash it afresh, and a
+     * case edited since it travelled would be quietly rewritten by an operation the clinic asked
+     * to be a posting and nothing else.
+     *
+     * @return array ok, error, retryable
+     */
+    public function confirm($rilvenId)
+    {
+        if ((int) $rilvenId <= 0) {
+            return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
+        }
+
+        $answer = $this->client->put('/waybill/update-status', array(
+            'ids'    => array((int) $rilvenId),
+            'status' => 2,
+        ));
+
+        if (!$answer['ok']) {
+            return array('ok' => FALSE, 'error' => $answer['error'],
+                         'retryable' => $answer['retryable']);
+        }
+        return array('ok' => TRUE, 'error' => '', 'retryable' => FALSE);
+    }
+
+    /**
      * Take the document back to a draft, which DELETES ITS POSTING.
      *
      * Rilven allows 2 → 1 and unconfirming removes the ledger entries -- it is the product's own

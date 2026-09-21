@@ -18,6 +18,8 @@
  *   retry     re-open rows that were given up on, after fixing what refused them.
  *             Takes an optional register: retry service
  *   resend    re-queue everything, delivered rows included. Takes "yes" and an optional register.
+ *   close     post what a period still holds as a draft, in the order the legs depend on.
+ *             Dry unless told otherwise: close 2026-09-01 2026-09-30 yes
  *   index     JSON: what is waiting, what failed and why. Also the browser page.
  */
 class Rilven_sync extends MY_Controller
@@ -148,6 +150,88 @@ class Rilven_sync extends MY_Controller
         $this->say(sprintf('[%s] rilven: re-opened %d row(s)%s for sending',
             date('Y-m-d H:i:s'), $this->rilven->resend($entity),
             $entity === NULL ? '' : ' in ' . $entity));
+    }
+
+    /**
+     * Close a period: post every document in it that Rilven still holds as a draft.
+     *
+     *     php index.php admin/rilven_sync close 2026-09-01 2026-09-30        counts, calls nothing
+     *     php index.php admin/rilven_sync close 2026-09-01 2026-09-30 yes    posts
+     *
+     * Dry by default, and the dry run is not a formality -- it is the whole point of having the
+     * command. It prints, leg by leg, what would be posted and which legs are switched off, and
+     * a period closed with a leg switched off is a half-closed period that looks finished.
+     *
+     * It can run while the cron does -- it only confirms, and never inserts -- with ONE thing
+     * worth knowing. An edit arriving for a case just confirmed makes the sale register unpost
+     * it, write the change, and then ask `shouldPost()` whether to confirm it again. While
+     * `rilven_sale_post` is FALSE the answer is no, so that case quietly goes back to being a
+     * draft in a period already called closed. Until that switch is on, re-run the dry close
+     * after the month's last edits and look at the count.
+     *
+     * Deliberately NOT part of `cron`. The cron keeps Rilven's documents matching the CMS; what
+     * a closed period is, is somebody deciding the month is done. That is a decision and not a
+     * schedule, and it is nearly impossible to take back: unconfirming removes entries, and a
+     * period Rilven itself has closed refuses even that.
+     */
+    public function close($from = '', $to = '', $confirm = '')
+    {
+        if ($from === '' || $to === '') {
+            $this->say('A period is two dates:');
+            $this->say('  php index.php admin/rilven_sync close 2026-09-01 2026-09-30');
+            $this->say('That counts what would be posted and calls nothing. To post, add yes:');
+            $this->say('  php index.php admin/rilven_sync close 2026-09-01 2026-09-30 yes');
+            return;
+        }
+
+        $posting = ($confirm === 'yes');
+        $result  = $this->rilven->closePeriod($from, $to, $posting);
+
+        if ($result['error'] !== '') {
+            $this->say('rilven close: ' . $result['error']);
+            return;
+        }
+
+        $this->say(sprintf('[%s] rilven close %s .. %s -- %s', date('Y-m-d H:i:s'),
+            $result['from'], $result['to'], $posting ? 'POSTING' : 'dry run, nothing was called'));
+
+        $off = array();
+        foreach ($result['legs'] as $entity => $leg) {
+            if (!$leg['enabled']) {
+                $off[] = $entity;
+                $this->say(sprintf('    %-10s %-12s %-16s DISABLED',
+                    $entity, $leg['pair'], $leg['what']));
+                continue;
+            }
+            $this->say(sprintf('    %-10s %-12s %-16s drafts=%d posted=%d failed=%d',
+                $entity, $leg['pair'], $leg['what'],
+                $leg['drafts'], $leg['posted'], $leg['failed']));
+
+            foreach ($leg['errors'] as $reason => $seen) {
+                $this->say(sprintf('        %5d x %s (first: %s)',
+                    $seen['count'], $reason, $seen['first']));
+            }
+        }
+
+        $this->say(sprintf('    TOTAL      drafts=%d posted=%d failed=%d',
+            $result['drafts'], $result['posted'], $result['failed']));
+
+        // Said last, where it is read, and said whether this was a dry run or not: a leg that is
+        // switched off contributes nothing and reports nothing, so the only sign of it is this.
+        if ($off) {
+            $this->say('    NOTE: ' . implode(', ', $off) . ' did not run. The period is not'
+                     . ' fully closed until every leg is switched on.');
+        }
+
+        if (!$posting && $result['drafts'] > 0) {
+            $this->say('    To post these: php index.php admin/rilven_sync close '
+                     . $result['from'] . ' ' . $result['to'] . ' yes');
+        }
+
+        if (!is_cli()) {
+            $this->output->set_content_type('application/json')
+                         ->set_output(json_encode($result, JSON_UNESCAPED_UNICODE));
+        }
     }
 
     /**

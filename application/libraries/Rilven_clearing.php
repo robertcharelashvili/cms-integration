@@ -411,6 +411,39 @@ class Rilven_clearing
                      'dependency' => FALSE, 'rilvenStatus' => 1);
     }
 
+    /**
+     * Confirm a settlement that is still a draft, for the period close.
+     *
+     * Like the financier register, this one posts nothing on its own. It is confirmed LAST of
+     * the four legs: the advance it consumes is put on 3120 by the receipt, and the receivable
+     * it closes is put on 1410 by the accrual, so both have to be entries and not drafts first.
+     *
+     * A refusal here is worth reading rather than retrying. The settlement ceiling means the
+     * lines of one case may not settle more than that case's services cost, and the financier's
+     * share has already taken part of that room. So `service-ceiling-exceeded` on this leg is
+     * not a fault in the sync -- it is a patient who has paid more than their own share, and a
+     * person has to decide what the excess is.
+     *
+     * @return array ok, error, retryable
+     */
+    public function confirm($rilvenId)
+    {
+        if ((int) $rilvenId <= 0) {
+            return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
+        }
+
+        $answer = $this->client->put('/settlement/update-status', array(
+            'ids'    => array((int) $rilvenId),
+            'status' => 2,
+        ));
+
+        if (!$answer['ok']) {
+            return array('ok' => FALSE, 'error' => $answer['error'],
+                         'retryable' => $answer['retryable']);
+        }
+        return array('ok' => TRUE, 'error' => '', 'retryable' => FALSE);
+    }
+
     private function rejected($error, $retryable, $dependency = FALSE)
     {
         return array('result' => 'rejected', 'id' => 0, 'error' => $error,

@@ -422,6 +422,38 @@ class Rilven_financing
                      'dependency' => FALSE, 'rilvenStatus' => 1);
     }
 
+    /**
+     * Confirm a settlement that is still a draft, for the period close.
+     *
+     * This register posts NOTHING by itself, by design: it writes the financier's share the
+     * moment the case is accrued, when the contract is known, and the money behind it is not.
+     * So every one of its documents is a draft until a close confirms it -- the 147 that exist
+     * today are all drafts -- and the close is the only thing that turns Дт1410 / Кт1410 into an
+     * entry.
+     *
+     * The order the close runs in is what makes this safe. The case's own accrual goes first, so
+     * the receivable this document moves exists before it is moved.
+     *
+     * @return array ok, error, retryable
+     */
+    public function confirm($rilvenId)
+    {
+        if ((int) $rilvenId <= 0) {
+            return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
+        }
+
+        $answer = $this->client->put('/settlement/update-status', array(
+            'ids'    => array((int) $rilvenId),
+            'status' => 2,
+        ));
+
+        if (!$answer['ok']) {
+            return array('ok' => FALSE, 'error' => $answer['error'],
+                         'retryable' => $answer['retryable']);
+        }
+        return array('ok' => TRUE, 'error' => '', 'retryable' => FALSE);
+    }
+
     private function rejected($error, $retryable, $dependency = FALSE)
     {
         return array('result' => 'rejected', 'id' => 0, 'error' => $error,
