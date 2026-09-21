@@ -163,6 +163,23 @@ class Rilven_deposit {
 
         $amount = $this->amountOf($row, $direction);
         if ($amount <= 0) {
+            // Empty in the direction's own column, but not in the other one, is a DIFFERENT
+            // thing and must not read as "nothing to post". It means the row's `paid_by` and the
+            // column its money is in disagree, and one of the two is wrong -- so this is a
+            // question about the data, not a quiet skip.
+            //
+            // `payment_link_refund` is exactly that: declared `out` in `rilven_deposit_kinds`,
+            // and all four rows in LJ's history carry their money in `amount`, the IN column.
+            // Two of them are real money. Named rather than guessed: reading the other column
+            // "because it has something in it" would post a refund as a receipt, or the reverse,
+            // on a kind nobody has looked at.
+            $other = $this->amountOf($row, $direction === 'out' ? 'in' : 'out');
+            if ($other > 0) {
+                $out['error'] = 'amount-is-in-the-other-column: ' . $this->val($row, 'kind')
+                              . ' is configured as ' . $direction;
+                return $out;
+            }
+
             // A zero payment is a row the clinic wrote and then emptied. There is nothing to post
             // and a document for it would be noise in the register.
             $out['error'] = 'amount-is-zero';
