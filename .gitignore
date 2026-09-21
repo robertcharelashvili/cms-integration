@@ -1,0 +1,8 @@
+# Nothing built here and nothing installed here: this is a handful of PHP files that are copied
+# into a CodeIgniter application. What must never arrive is a CONFIGURED copy of the config --
+# the one in the tree is a template with an empty rilven_secret_key, and the live one holds the
+# clinic's password.
+application/config/rilven.local.php
+*.bak
+*.bak_*
+*.orig
