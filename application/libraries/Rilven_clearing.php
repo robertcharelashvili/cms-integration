@@ -428,14 +428,36 @@ class Rilven_clearing
      */
     public function confirm($rilvenId)
     {
-        if ((int) $rilvenId <= 0) {
+        return $this->confirmMany(array($rilvenId));
+    }
+
+    /**
+     * Confirm SEVERAL documents in one call.
+     *
+     * The route takes `ids` as a list and always did; the close was sending them one at a time,
+     * which for a year of documents is a quarter of a million requests and about eleven hours.
+     *
+     * A batch is ALL-OR-NOTHING on the far side: the handler is `@Transactional` and refuses the
+     * whole call if one id is not loadable. So the caller must treat a failed batch as "unknown
+     * which one" and fall back to sending them singly -- {@see Rilven::closePeriod}. Speed when
+     * everything is well, precision when it is not.
+     *
+     * @param  array $rilvenIds
+     * @return array ok, error, retryable
+     */
+    public function confirmMany($rilvenIds)
+    {
+        $ids = array();
+        foreach ((array) $rilvenIds as $one) {
+            if ((int) $one > 0) {
+                $ids[] = (int) $one;
+            }
+        }
+        if (empty($ids)) {
             return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
         }
 
-        $answer = $this->client->put('/settlement/update-status', array(
-            'ids'    => array((int) $rilvenId),
-            'status' => 2,
-        ));
+        $answer = $this->client->put('/settlement/update-status', array('ids' => $ids, 'status' => 2));
 
         if (!$answer['ok']) {
             return array('ok' => FALSE, 'error' => $answer['error'],
@@ -517,6 +539,63 @@ class Rilven_clearing
     // -----------------------------------------------------------------------
     // small things
     // -----------------------------------------------------------------------
+
+    /**
+     * The document's instant, in UTC.
+     *
+     * `posting_date` first: the date the case's ACCRUAL carries, which is the latest post_date
+     * among its service lines and not the day the case was opened. A clearing settles against
+     * that accrual, so it has to be dated with it -- otherwise the advance meets a receivable
+     * that, in ledger time, is not there yet.
+     */
+    private function instant($row)
+    {
+        $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        $raw = isset($row->posting_date) ? trim((string) $row->posting_date) : '';
+        if ($raw === '' || strpos($raw, '0000-00-00') === 0) {
+            $raw = isset($row->$column) ? trim((string) $row->$column) : '';
+        }
+        if ($raw === '' || strpos($raw, '0000-00-00') === 0) {
+            return NULL;
+        }
+        $stamp = strtotime($raw);
+        if ($stamp === FALSE) {
+            return NULL;
+        }
+        $local = date('Y-m-d H:i:s', $stamp);
+
+        $zone = trim((string) $this->client->cfg('rilven_source_timezone', ''));
+        if ($zone === '') {
+            return $local;
+        }
+        try {
+            $dt = new DateTime($local, new DateTimeZone($zone));
+            $dt->setTimezone(new DateTimeZone('UTC'));
+            return $dt->format('Y-m-d H:i:s');
+        } catch (Exception $e) {
+            log_message('error', 'rilven: clearing cannot convert ' . $local . ': ' . $e->getMessage());
+            return $local;
+        }
+    }
+
+    /** What the settlement says about itself: the case it belongs to. */
+    private function comment($row)
+    {
+        $parts = array('CMS case ' . $row->id);
+        $reference = isset($row->reference_no) ? trim((string) $row->reference_no) : '';
+        if ($reference !== '') {
+            array_unshift($parts, $reference);
+        }
+        return implode(' / ', $parts);
+    }
+
+    /** What one line says: how the money came in, so the ledger line is readable. */
+    private function paymentComment($payment)
+    {
+        $method = isset($payment->paid_by) ? trim((string) $payment->paid_by) : '';
+        $id     = isset($payment->id) ? $payment->id : '?';
+        return $method !== '' ? ($method . ' ' . $id) : ('payment ' . $id);
+    }
 
     private function money($value)
     {

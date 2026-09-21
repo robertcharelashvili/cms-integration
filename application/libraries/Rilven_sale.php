@@ -1113,14 +1113,36 @@ class Rilven_sale
      */
     public function confirm($rilvenId)
     {
-        if ((int) $rilvenId <= 0) {
+        return $this->confirmMany(array($rilvenId));
+    }
+
+    /**
+     * Confirm SEVERAL documents in one call.
+     *
+     * The route takes `ids` as a list and always did; the close was sending them one at a time,
+     * which for a year of documents is a quarter of a million requests and about eleven hours.
+     *
+     * A batch is ALL-OR-NOTHING on the far side: the handler is `@Transactional` and refuses the
+     * whole call if one id is not loadable. So the caller must treat a failed batch as "unknown
+     * which one" and fall back to sending them singly -- {@see Rilven::closePeriod}. Speed when
+     * everything is well, precision when it is not.
+     *
+     * @param  array $rilvenIds
+     * @return array ok, error, retryable
+     */
+    public function confirmMany($rilvenIds)
+    {
+        $ids = array();
+        foreach ((array) $rilvenIds as $one) {
+            if ((int) $one > 0) {
+                $ids[] = (int) $one;
+            }
+        }
+        if (empty($ids)) {
             return array('ok' => FALSE, 'error' => 'no-document', 'retryable' => FALSE);
         }
 
-        $answer = $this->client->put('/waybill/update-status', array(
-            'ids'    => array((int) $rilvenId),
-            'status' => 2,
-        ));
+        $answer = $this->client->put('/waybill/update-status', array('ids' => $ids, 'status' => 2));
 
         if (!$answer['ok']) {
             return array('ok' => FALSE, 'error' => $answer['error'],

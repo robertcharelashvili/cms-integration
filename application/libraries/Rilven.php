@@ -1705,6 +1705,7 @@ class Rilven
         }
 
         $this->attachPatientIds($row);
+        $this->attachPostingDate($row);
         return $row;
     }
 
@@ -1883,6 +1884,7 @@ class Rilven
         }
 
         $this->attachPatientIds($row);
+        $this->attachPostingDate($row);
         return $row;
     }
 
@@ -2515,6 +2517,58 @@ class Rilven
     }
 
     /**
+     * The date a case's postings actually CARRY in Rilven, as SQL.
+     *
+     * Not the case date. {@see Rilven_sale::lastPostDate} dates the accrual by the latest
+     * `post_date` among the case's service lines -- the day the work was done -- and falls back
+     * to the case date only when there is none. Measured 2026-09-22 over 2025 onward: 1,298
+     * cases out of 133,256 post in a different month from the one they were opened in. One per
+     * cent of the cases and 1,531,828.44 -- close to six per cent of the money, because the
+     * cases that run on are the big ones.
+     *
+     * Everything that reasons about a PERIOD has to use this, or it is reasoning about a
+     * different period than the ledger is.
+     */
+    private function postingDateSql($alias)
+    {
+        $prefix = $this->CI->db->dbprefix;
+        $items  = $prefix . (string) $this->client->cfg('rilven_sale_item_table', 'sale_items');
+        $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        $where  = $this->whereSql($this->client->cfg('rilven_sale_item_where', array()), 'pdi.');
+
+        return 'COALESCE((SELECT MAX(pdi.post_date) FROM ' . $items . ' pdi'
+             . ' WHERE pdi.sale_id = ' . $alias . 'id AND ' . $where
+             . " AND pdi.post_date > '2000-01-01'), " . $alias . $column . ')';
+    }
+
+    /**
+     * Put that same date on a loaded row, so the settlement registers date themselves by it.
+     *
+     * They dated by the CASE, and the accrual dates by the work -- so a case opened in February
+     * whose surgery happened in May put its accrual in May and the financier's share of that
+     * very accrual in February. The share divides a receivable that does not exist yet, in a
+     * month that has already been closed. One case, one date, whichever leg is writing.
+     */
+    private function attachPostingDate($row)
+    {
+        $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        $row->posting_date = isset($row->$column) ? (string) $row->$column : '';
+
+        $table = (string) $this->client->cfg('rilven_sale_item_table', 'sale_items');
+        $this->CI->db->select('MAX(i.post_date) AS d', FALSE)->from($table . ' i')
+                     ->where('i.sale_id', $row->id)
+                     ->where("i.post_date > '2000-01-01'", NULL, FALSE);
+        $this->applyWhere($this->client->cfg('rilven_sale_item_where', array()), 'i.');
+
+        $found = $this->CI->db->get()->row();
+        $value = ($found && $found->d !== NULL) ? trim((string) $found->d) : '';
+        if ($value !== '' && strpos($value, '0000-00-00') !== 0) {
+            $row->posting_date = $value;
+        }
+        return $row;
+    }
+
+    /**
      * Do the case's services, its own header and its accrual all say the same number?
      *
      * Three records of one amount, written by different parts of the CMS at different moments,
@@ -2561,9 +2615,13 @@ class Rilven
         // does: a case older than the register cannot disagree with a Rilven document that was
         // never created, and blocking a close over one would make closing impossible for ever.
         $since = trim((string) $this->client->cfg('rilven_sale_from', ''));
+        // Judged by the date the postings will CARRY, the same as the close selects by. A
+        // reconciliation over one set of cases guarding a posting run over another set is not a
+        // guard at all.
+        $posted = $this->postingDateSql('s.');
         $scope = $saleWhere
-               . ' AND DATE(s.' . $column . ') >= ' . $this->CI->db->escape($from)
-               . ' AND DATE(s.' . $column . ') <= ' . $this->CI->db->escape($to)
+               . ' AND DATE(' . $posted . ') >= ' . $this->CI->db->escape($from)
+               . ' AND DATE(' . $posted . ') <= ' . $this->CI->db->escape($to)
                . ($since === '' ? '' : ' AND DATE(s.' . $column . ') >= ' . $this->CI->db->escape($since));
 
         $figures = 'SELECT s.id, s.' . $column . ' AS d,'
@@ -2708,38 +2766,68 @@ class Rilven
                 $one['drafts'] = count($rows);
 
                 if ($confirm && !$one['held']) {
-                    foreach ($rows as $row) {
-                        $answer = $register->confirm((int) $row->rilven_id);
-                        if ($answer['ok']) {
-                            $this->CI->db->where('id', $row->outbox_id)
-                                         ->update('rilven_outbox', array('rilven_status' => 2));
-                            $one['posted']++;
-                            $consecutive = 0;
-                            continue;
+                    // IN BATCHES, and the batch is the difference between this finishing and
+                    // not. A year of documents is a quarter of a million confirmations, which
+                    // one at a time is about eleven hours; at 25 to a call it is minutes. The
+                    // route always took a list -- the close simply never used it.
+                    $size = (int) $this->client->cfg('rilven_close_batch', 25);
+                    if ($size < 1) {
+                        $size = 1;
+                    }
+
+                    foreach (array_chunk($rows, $size) as $chunk) {
+                        $ids = array();
+                        foreach ($chunk as $row) {
+                            $ids[] = (int) $row->rilven_id;
                         }
 
-                        // Grouped, not listed. One reason refusing four hundred documents is
-                        // one thing to fix; four hundred lines is a wall nobody reads.
-                        $reason = $answer['error'];
-                        if (!isset($one['errors'][$reason])) {
-                            $one['errors'][$reason] = array('count' => 0, 'first' => $row->external_id);
+                        $answer = count($ids) === 1
+                            ? $register->confirm($ids[0])
+                            : $register->confirmMany($ids);
+
+                        if ($answer['ok']) {
+                            $this->markPosted($chunk);
+                            $one['posted'] += count($chunk);
+                            $consecutive = 0;
+                        } else {
+                            // The far side is @Transactional and refuses the WHOLE call when one
+                            // id is not loadable, so a failed batch says nothing about which
+                            // document is at fault. Send them singly to find out: the good ones
+                            // still post, and the bad one is named instead of taking 24 with it.
+                            foreach ($chunk as $row) {
+                                $single = $register->confirm((int) $row->rilven_id);
+                                if ($single['ok']) {
+                                    $this->markPosted(array($row));
+                                    $one['posted']++;
+                                    $consecutive = 0;
+                                    continue;
+                                }
+
+                                // Grouped, not listed. One reason refusing four hundred documents
+                                // is one thing to fix; four hundred lines is a wall nobody reads.
+                                $reason = $single['error'];
+                                if (!isset($one['errors'][$reason])) {
+                                    $one['errors'][$reason] = array('count' => 0,
+                                                                    'first' => $row->external_id);
+                                }
+                                $one['errors'][$reason]['count']++;
+                                $one['failed']++;
+                                $consecutive++;
+                            }
                         }
-                        $one['errors'][$reason]['count']++;
-                        $one['failed']++;
-                        $consecutive++;
 
                         // The same two guards push() has, and they are needed more here, not
                         // less: push() works through a queue that survives being stopped, while
-                        // this walks six hundred documents in one go with nothing to resume
-                        // from. A refused credential refuses every one of them, and a far side
-                        // that is down does not want six hundred more requests to prove it.
+                        // this walks a year of documents with nothing to resume from. A refused
+                        // credential refuses every one of them, and a far side that is down does
+                        // not want the rest of the year to prove it.
                         if ($this->client->credentialRefused()) {
                             $out['stopped'] = 'credential refused: ' . $this->client->lastError();
                             break;
                         }
                         if ($consecutive >= self::GIVE_THE_SERVER_A_REST) {
                             $out['stopped'] = 'stopped after ' . $consecutive
-                                . ' in a row failed for the same outside reason: ' . $reason;
+                                . ' in a row failed for the same outside reason';
                             break;
                         }
                     }
@@ -2766,6 +2854,25 @@ class Rilven
     }
 
     /**
+     * Record that these documents are posted, in ONE statement.
+     *
+     * A row per update would undo what batching just bought: the point of sending 25
+     * confirmations in one call is not to follow it with 25 round trips to our own database.
+     */
+    private function markPosted($rows)
+    {
+        $ids = array();
+        foreach ($rows as $row) {
+            $ids[] = (int) $row->outbox_id;
+        }
+        if (empty($ids)) {
+            return;
+        }
+        $this->CI->db->where_in('id', $ids)
+                     ->update('rilven_outbox', array('rilven_status' => 2));
+    }
+
+    /**
      * The documents of one register that are in this period and are still drafts.
      *
      * `rilven_status` NULL counts as a draft for the reason {@see ripenSales} gives: rows that
@@ -2782,9 +2889,14 @@ class Rilven
         if ($source === 'deposit') {
             $table  = $prefix . (string) $this->client->cfg('rilven_deposit_source_table', 'deposits');
             $column = (string) $this->client->cfg('rilven_deposit_date_column', 'date');
+            // A receipt IS its own date: the money arrived when it arrived.
+            $dateExpr = 'src.' . $column;
         } else {
             $table  = $prefix . (string) $this->client->cfg('rilven_sale_source_table', 'sales');
             $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+            // NOT the case date. {@see postingDateSql} -- a period has to mean the same thing
+            // here as it does in the ledger, or closing February posts entries into May.
+            $dateExpr = $this->postingDateSql('src.');
         }
         if ($column === '') {
             return array();
@@ -2822,8 +2934,8 @@ class Rilven
 
         $this->CI->db
             // DATE() so a column that carries a time does not drop the last day of the period.
-            ->where('DATE(src.' . $column . ') >=', $from)
-            ->where('DATE(src.' . $column . ') <=', $to)
+            ->where('DATE(' . $dateExpr . ') >= ' . $this->CI->db->escape($from), NULL, FALSE)
+            ->where('DATE(' . $dateExpr . ') <= ' . $this->CI->db->escape($to), NULL, FALSE)
             ->order_by('src.' . $column . ' ASC, src.id ASC', '', FALSE);
 
         if ((int) $limit > 0) {

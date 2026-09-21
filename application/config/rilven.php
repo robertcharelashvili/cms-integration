@@ -127,6 +127,18 @@ $config['rilven_enabled'] = TRUE;
 // this is not a payload size; it is how often the run stops to look at the clock.
 $config['rilven_batch'] = 200;
 
+// How many documents one CONFIRMATION carries when a period is closed.
+//
+// `/waybill/update-status` and `/settlement/update-status` both take a LIST of ids, and the
+// close used to send one at a time: a year of documents is about a quarter of a million calls
+// and eleven hours. At 25 to a call it is minutes.
+//
+// The far side is @Transactional per call, so a batch is all-or-nothing and a failed one says
+// nothing about WHICH document broke it. The close answers that by re-sending a failed batch
+// one at a time, so the good ones still post and the bad one is named. Raising this makes the
+// good case faster and the bad case slower; 1 restores the old behaviour exactly.
+$config['rilven_close_batch'] = 25;
+
 // The ceiling for one cron run, so a first catch-up of seventy thousand patients
 // cannot run into the working day. 0 means no limit.
 $config['rilven_max_rows'] = 2000;
