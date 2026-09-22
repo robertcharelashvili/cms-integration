@@ -2542,6 +2542,44 @@ class Rilven
     }
 
     /**
+     * Does THIS case agree with itself? As SQL, for excluding the ones that do not.
+     *
+     * The gate used to hold a whole leg: three bad cases in January stopped 6,775 correct
+     * accruals, and 34,145 across the first half of 2025 waited on ten. That is not caution, it
+     * is a month held hostage -- a case that reconciles posts an accrual equal to its own
+     * services and is right whatever its neighbour does.
+     *
+     * So the hold is per CASE now. The offenders stay drafts until somebody fixes them in the
+     * case, and the period still reports as not reconciled until they are. Nothing is posted
+     * that would have to be unpicked, which was the whole reason for the gate.
+     *
+     * Two ways a case fails: the three figures disagree, or the item scope EXCLUDES a line that
+     * carries money -- money in the case that will never be accrued, on which the three agree
+     * with each other and are wrong together.
+     */
+    private function caseReconcilesSql($alias)
+    {
+        $prefix = $this->CI->db->dbprefix;
+        $items  = $prefix . (string) $this->client->cfg('rilven_sale_item_table', 'sale_items');
+        $pay    = $prefix . (string) $this->client->cfg('rilven_financing_source_table', 'payments');
+        $type   = (string) $this->client->cfg('rilven_financing_payment_type', 'accruing');
+        $scope  = $this->whereSql($this->client->cfg('rilven_sale_item_where', array()), 'ri.');
+
+        $services = '(SELECT COALESCE(SUM(ri.subtotal), 0) FROM ' . $items . ' ri'
+                  . ' WHERE ri.sale_id = ' . $alias . 'id AND ' . $scope . ')';
+        $accrued  = '(SELECT COALESCE(SUM(rp.amount_credit), 0) FROM ' . $pay . ' rp'
+                  . ' WHERE rp.sale_id = ' . $alias . 'id AND rp.type = '
+                  . $this->CI->db->escape($type) . ')';
+        $orphan   = '(SELECT COUNT(*) FROM ' . $items . ' ri'
+                  . ' WHERE ri.sale_id = ' . $alias . 'id AND NOT (' . $scope . ')'
+                  . ' AND ri.subtotal <> 0)';
+
+        return '(ROUND(' . $services . ', 2) = ROUND(' . $alias . 'grand_total, 2)'
+             . ' AND ROUND(' . $services . ', 2) = ROUND(' . $accrued . ', 2)'
+             . ' AND ' . $orphan . ' = 0)';
+    }
+
+    /**
      * Put that same date on a loaded row, so the settlement registers date themselves by it.
      *
      * They dated by the CASE, and the accrual dates by the work -- so a case opened in February
@@ -2761,8 +2799,12 @@ class Rilven
             $register = $leg['register'];
             if ($register->enabled()) {
                 $one['enabled'] = TRUE;
-                $one['held'] = ($out['blocked'] !== '' && $leg['gated']);
-                $rows = $this->closeDrafts($entity, $leg['source'], $from, $to, $limit);
+                // NOT held any more: the offending cases are excluded from the draft set
+                // instead, so the rest of the period posts. `held` stays in the shape for
+                // callers, and means "this leg refused to run at all", which now never happens.
+                $one['held'] = FALSE;
+                $rows = $this->closeDrafts($entity, $leg['source'], $from, $to, $limit,
+                                            !empty($leg['gated']));
                 $one['drafts'] = count($rows);
 
                 if ($confirm && !$one['held']) {
@@ -2882,7 +2924,7 @@ class Rilven
      * case sent late, resent, or corrected last week still belongs to the month it happened in,
      * and closing September must not depend on when the queue got round to it.
      */
-    private function closeDrafts($entity, $source, $from, $to, $limit)
+    private function closeDrafts($entity, $source, $from, $to, $limit, $gated = FALSE)
     {
         $prefix = $this->CI->db->dbprefix;
 
@@ -2937,6 +2979,12 @@ class Rilven
             ->where('DATE(' . $dateExpr . ') >= ' . $this->CI->db->escape($from), NULL, FALSE)
             ->where('DATE(' . $dateExpr . ') <= ' . $this->CI->db->escape($to), NULL, FALSE)
             ->order_by('src.' . $column . ' ASC, src.id ASC', '', FALSE);
+
+        // A gated leg skips the cases that do not agree with themselves, instead of the whole
+        // period skipping because of them. See caseReconcilesSql().
+        if ($gated && $source !== 'deposit') {
+            $this->CI->db->where($this->caseReconcilesSql('src.'), NULL, FALSE);
+        }
 
         if ((int) $limit > 0) {
             $this->CI->db->limit((int) $limit);

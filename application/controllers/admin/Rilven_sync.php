@@ -291,8 +291,9 @@ class Rilven_sync extends MY_Controller
         }
 
         if ($result['blocked'] !== '') {
-            $this->say('    The legs that read the case were HELD. The receipt was not: the money'
-                     . ' arrived whatever the case says. Fix the cases above and run this again.');
+            $this->say('    The cases named above were LEFT AS DRAFTS; everything else in the'
+                     . ' period posted. Fix them in the case and run this again -- what is'
+                     . ' already posted is not selected a second time.');
         }
 
         if (!$posting && $result['drafts'] > 0) {
@@ -422,9 +423,8 @@ class Rilven_sync extends MY_Controller
             if ($result['blocked'] !== '') {
                 $html .= '<div class="msg warn" style="margin-top:12px"><b>Период не сходится.</b>'
                        . '<br>' . $h($result['blocked'])
-                       . '<br>Удержаны проводки, которые читают случай — начисление, доля'
-                       . ' финансиста, зачёт. Приход денег не удержан: деньги пришли независимо'
-                       . ' от того, что говорит случай.'
+                       . '<br>Эти случаи оставлены черновиками — остальное за период проведено.'
+                       . ' Держится случай, а не месяц вокруг него.'
                        . '<br>Случай правится в самом случае, а не запросом.</div>';
 
                 if ($check !== NULL && $check['rows']) {
