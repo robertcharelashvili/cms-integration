@@ -1900,6 +1900,7 @@ class Rilven
     {
         $payments = (string) $this->client->cfg('rilven_financing_source_table', 'payments');
         $source   = (string) $this->client->cfg('rilven_source_table', 'companies');
+        $items    = (string) $this->client->cfg('rilven_sale_item_table', 'sale_items');
 
         // GROUPED BY SERVICE AND FINANCIER, and summed. Two things force this.
         //
@@ -1914,11 +1915,17 @@ class Rilven
         // shares are one financier paying one service line twice -- 150.00 and 242.00 on the
         // same row. They are the same debt, so they are summed rather than tie-broken with an
         // ordinal, which would be a second unstable number in the key.
+        // `item_charged` comes along for the ceiling the settlement has to respect. It is the
+        // very number the accrual line carries -- Rilven_sale sends money(sale_items.subtotal)
+        // and nothing else -- so capping against it compares like with like rather than against
+        // a figure recomputed here. See Rilven_financing::map(), which spends it.
         $this->CI->db
             ->select('MIN(p.id) AS id, p.sale_id, p.sale_item_id, p.company_id,'
-                   . ' SUM(p.amount_credit) AS amount_credit, c.name AS financier_name', FALSE)
+                   . ' SUM(p.amount_credit) AS amount_credit, c.name AS financier_name,'
+                   . ' MAX(i.subtotal) AS item_charged', FALSE)
             ->from($payments . ' p')
             ->join($source . ' c', 'c.id = p.company_id', 'inner')
+            ->join($items . ' i', 'i.id = p.sale_item_id', 'left')
             ->where('p.sale_id', $saleId)
             ->where('p.type', (string) $this->client->cfg('rilven_financing_payment_type', 'accruing'))
             ->where('p.amount_credit <>', 0)

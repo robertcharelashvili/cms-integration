@@ -254,9 +254,14 @@ class Rilven_financing
             return $out;
         }
 
+        // What each service line has left to give, so a share cannot ask for more than the
+        // accrual charged. Rilven enforces this itself and answers `settlement-exceeds-service`;
+        // what is trimmed here is only the sub-cent difference described in line().
+        $remaining = array();
+
         $items = array();
         foreach ($row->shares as $share) {
-            $line = $this->line($share, $patientBranchId);
+            $line = $this->line($share, $patientBranchId, $remaining);
             if ($line['error'] !== '') {
                 // One unresolvable share refuses the WHOLE document. A settlement that carries
                 // some of a case's shares and not others is worse than none: the receivable is
@@ -288,7 +293,7 @@ class Rilven_financing
      * taking over part of a receivable is 1410/1410, while the clinic's own concession is
      * nobody's receivable at all and goes to 8290/1410 as a taxable expense.
      */
-    private function line($share, $patientBranchId)
+    private function line($share, $patientBranchId, &$remaining = NULL)
     {
         $out = array('item' => array(), 'error' => '');
 
@@ -297,6 +302,8 @@ class Rilven_financing
             $out['error'] = 'share-amount-is-zero';
             return $out;
         }
+
+        $amount = $this->withinWhatWasCharged($share, $amount, $remaining);
 
         $companyId  = (int) (isset($share->company_id) ? $share->company_id : 0);
         $concession = $this->isConcession($companyId);
@@ -629,6 +636,53 @@ class Rilven_financing
         $name = isset($share->financier_name) ? trim((string) $share->financier_name) : '';
         return $name !== '' ? $name : ('payment ' . $share->id);
     }
+
+    /**
+     * A share, trimmed to what its service line was actually charged -- but only by crumbs.
+     *
+     * The clinic's catalogue holds some prices to four decimal places, so a line is charged
+     * 1309.2065 while the payments against it are recorded to the tetri, 1309.21. Rilven's
+     * SettlementService compares the two exactly and refuses the whole document with
+     * `settlement-exceeds-service` over 0.0035 GEL. Both figures are right in their own terms
+     * and neither is a mistake anybody made; the clinic cannot fix it in the case, because
+     * there is nothing there to fix.
+     *
+     * So a share that overshoots by LESS THAN A TETRI is trimmed to the ceiling. A share that
+     * overshoots by a tetri or more is left exactly as it is and Rilven refuses it, loudly --
+     * that one is a real disagreement about money and wants a person, which is the whole reason
+     * that guard exists. Trimming it here would settle a debt the case never charged.
+     *
+     * The ceiling is spent across the shares of one line in the order they arrive, so two
+     * financiers on one service cannot each be trimmed into the same tetri twice.
+     *
+     * @param  array|null $remaining  what each sale_item has left, carried between the shares
+     */
+    private function withinWhatWasCharged($share, $amount, &$remaining)
+    {
+        if (!is_array($remaining) || !isset($share->sale_item_id) || !isset($share->item_charged)) {
+            return $amount;
+        }
+
+        $itemId = (int) $share->sale_item_id;
+        if ($itemId <= 0) {
+            return $amount;
+        }
+
+        if (!array_key_exists($itemId, $remaining)) {
+            $remaining[$itemId] = $this->money($share->item_charged);
+        }
+
+        $left = $remaining[$itemId];
+        if ($left > 0 && $amount > $left && ($amount - $left) < self::A_TETRI) {
+            $amount = $left;
+        }
+        $remaining[$itemId] = $left - $amount;
+
+        return $amount;
+    }
+
+    /** Money is scaled by 10 000 over there, so the clinic's smallest coin is 100 of these. */
+    const A_TETRI = 100;
 
     private function money($value)
     {
