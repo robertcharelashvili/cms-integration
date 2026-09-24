@@ -2801,6 +2801,9 @@ class Rilven
         foreach ($this->closeLegs() as $entity => $leg) {
             $one = array('pair' => $leg['pair'], 'what' => $leg['what'], 'enabled' => FALSE,
                          'held' => FALSE, 'drafts' => 0, 'posted' => 0, 'failed' => 0,
+                         // how many drafts were left alone because their case is not finished --
+                         // reported, or the close would silently do less than its count says
+                         'unfinished' => 0,
                          'errors' => array());
 
             $register = $leg['register'];
@@ -2813,6 +2816,37 @@ class Rilven
                 $rows = $this->closeDrafts($entity, $leg['source'], $from, $to, $limit,
                                             !empty($leg['gated']));
                 $one['drafts'] = count($rows);
+
+                // A case that is not finished is not closed, however old it is.
+                //
+                // The per-case path has always refused to post one -- it reads sale_status and
+                // holds anything that is not complete, because posting FREEZES the document: the
+                // CMS guard refuses an edit once Rilven reports a status above draft. The close did
+                // not ask. It took every draft in the period and confirmed it, so a month close was
+                // quietly accruing revenue on cases the doctor had not finished writing, and
+                // locking them against being finished at the same time. At LJ that is 527
+                // documents -- 363 on service 4 and 164 on service 3, all of them still `pending`.
+                //
+                // isFinished(), not shouldPost(): the latter also asks the streaming path's master
+                // switch, which is FALSE here, and a ripening delay that a period close is the
+                // opposite of. See the note on isFinished.
+                //
+                // Only the legs that READ the case. A receipt reads none of it -- the patient
+                // handed money over and the till holds it, which is true whatever the case turns
+                // out to say -- and holding that back would leave real money out of the books.
+                $held = array();
+                if ($leg['source'] !== 'deposit') {
+                    $ready = array();
+                    foreach ($rows as $row) {
+                        if ($this->sale->isFinished($row)) {
+                            $ready[] = $row;
+                        } else {
+                            $held[] = $row;
+                        }
+                    }
+                    $rows = $ready;
+                }
+                $one['unfinished'] = count($held);
 
                 if ($confirm && !$one['held']) {
                     // IN BATCHES, and the batch is the difference between this finishing and
@@ -2951,8 +2985,13 @@ class Rilven
             return array();
         }
 
+        // The case's own columns come along for the sale legs, because the close has to be able to
+        // ask the same question the per-case path asks -- is this case finished? -- and that reads
+        // sale_status, service and the date. `src.*` FIRST so the aliased outbox columns win if a
+        // future column on the source ever shares a name with one of them.
         $this->CI->db
-            ->select('o.id AS outbox_id, o.external_id, o.rilven_id', FALSE)
+            ->select(($source === 'deposit' ? '' : 'src.*, ')
+                     . 'o.id AS outbox_id, o.external_id, o.rilven_id', FALSE)
             ->from($prefix . 'rilven_outbox o')
             ->join($table . ' src', 'src.id = CAST(o.external_id AS UNSIGNED)', 'inner', FALSE)
             ->where('o.entity', $entity)

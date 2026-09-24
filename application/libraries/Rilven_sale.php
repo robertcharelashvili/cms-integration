@@ -677,6 +677,30 @@ class Rilven_sale
         if (!$this->hasRipened($row)) {
             return FALSE;
         }
+        return $this->isFinished($row);
+    }
+
+    /**
+     * Whether the CASE is finished -- the clinic's rule on its own, with nothing around it.
+     *
+     * Split out of {@see shouldPost} because the month close needs this question and only this
+     * one. The two guards it leaves behind both govern the STREAMING path and not a close:
+     *
+     *   `rilven_sale_post` is the master switch for confirming a case as it arrives. It is FALSE
+     *   here, which is why every case lands as a draft and the close is the only thing that posts
+     *   anything at all. Asking it inside the close would make the close post nothing.
+     *
+     *   `rilven_sale_post_after_days` holds a case back until it has stood still that long, so a
+     *   case recorded today is not frozen while the doctor is still writing it. A period close is
+     *   already the opposite of same-day: it runs after the month has ended, deliberately, on a
+     *   period somebody decided to close. Applying the delay there would mean closing September in
+     *   October posts nothing from late September, which is not a close.
+     *
+     * One definition of "finished", used by both, so the two paths cannot drift into disagreeing
+     * about which cases belong in the books.
+     */
+    public function isFinished($row)
+    {
         if ($this->isOutpatient($row)) {
             return $this->client->cfg('rilven_sale_post_outpatient', TRUE) ? TRUE : FALSE;
         }
