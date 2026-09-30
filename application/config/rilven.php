@@ -1070,3 +1070,29 @@ $config['rilven_clearing_code_prefix'] = 'p';
 $config['rilven_clearing_company_branch_id'] = 30;
 $config['rilven_clearing_currency_id']       = 44;
 
+
+// ---------------------------------------------------------------------------
+// PAYROLL -- the latest CONFIRMED run of every month, all salary types
+// ---------------------------------------------------------------------------
+//
+// Every salary type of the run: 1-4 the percentages (outpatient, day hospital, inpatient, team
+// output), 5 duty shifts, 6 fixed pay -- LJ keeps no salary cards in Rilven. Taxes are computed
+// in the Rilven salary accrual. One Rilven document per month (salary-variable), GROSS amounts,
+// replaced by a newly confirmed run until a Rilven salary accrual takes the month.
+//
+// Only a run confirmed in the salary register (sma_daricxva.rilven_status = 1, needs
+// upgrade/payroll-confirm.sql and host-patches/payroll-confirm.md), as it stood when confirmed.
+//
+// OFF by default. One month by hand: php index.php admin/rilven_sync payroll 2026-08
+$config['rilven_payroll_enabled'] = FALSE;
+$config['rilven_payroll_months_back'] = 3;
+// a fixed first month instead of months_back: every month from here on is sent and kept current
+$config['rilven_payroll_since'] = '2025-01-01';
+$config['rilven_payroll_months_per_tick'] = 2;
+$config['rilven_payroll_code_prefix'] = 'cms-';
+$config['rilven_payroll_company_branch_id'] = 30;
+// staff of these departments are expensed on the admin account; everybody else on 7320
+$config['rilven_payroll_admin_departments'] = array('ადმინისტრაცია');
+$config['rilven_payroll_admin_account'] = '7410';
+// who may confirm a payroll run for Rilven in the salary register, besides the owner (sma_groups.name)
+$config['rilven_payroll_confirm_groups'] = array('accounting', 'chief_accountant');

@@ -21,6 +21,7 @@
  *   close     post what a period still holds as a draft, in the order the legs depend on.
  *             Dry unless told otherwise: close 2026-09-01 2026-09-30 yes
  *   index     JSON: what is waiting, what failed and why. Also the browser page.
+ *   payroll   the variable part of one month's payroll: payroll 2026-08 [force]
  */
 class Rilven_sync extends MY_Controller
 {
@@ -90,12 +91,45 @@ class Rilven_sync extends MY_Controller
             $this->say(sprintf('    %5d x %s (first: %s)', $seen['count'], $reason, $seen['first']));
         }
 
+        // the variable part of payroll: the latest run of each recent month, when it changed
+        $this->load->library('rilven_payroll');
+        if ($this->rilven_payroll->enabled()) {
+            foreach ($this->rilven_payroll->sweep() as $month) {
+                if ($month['sent'] || !$month['ok']) {
+                    $this->sayPayroll($month);
+                }
+            }
+        }
+
         if (!is_cli()) {
             $this->output->set_content_type('application/json')->set_output(json_encode(array(
                 'status' => 'ok', 'queued' => $queued, 'summary' => $summary,
                 'refusals' => $this->rilven->refusals,
             ), JSON_UNESCAPED_UNICODE));
         }
+    }
+
+    /**
+     * One month's payroll (every salary type of its latest run), sent now:
+     *
+     *     php index.php admin/rilven_sync payroll 2026-08
+     *     php index.php admin/rilven_sync payroll 2026-08 force
+     *
+     * Works whether or not rilven_payroll_enabled is on: it is the way to send one month by hand
+     * and look at it in Rilven before the cron is allowed to.
+     */
+    public function payroll($month = '', $force = '')
+    {
+        $this->load->library('rilven_payroll');
+        $this->sayPayroll($this->rilven_payroll->syncMonth($month, $force === 'force'));
+    }
+
+    private function sayPayroll($m)
+    {
+        $this->say(sprintf('[%s] rilven: payroll %s run=%s lines=%s amount=%s %s', date('Y-m-d H:i:s'),
+            $m['month'], isset($m['run']) ? $m['run'] : '-', isset($m['lines']) ? $m['lines'] : '-',
+            isset($m['amount']) ? number_format($m['amount'], 2, '.', '') : '-',
+            $m['ok'] ? (!empty($m['sent']) ? 'sent' : 'unchanged') : 'REFUSED: ' . $m['error']));
     }
 
     /** Top the queue up and send nothing, for a first look at how much there is. */

@@ -1,0 +1,167 @@
+--- app/controllers/admin/Billers.php.orig	(md5 0ce3a148217f5236b2c29619e4eefe2d)
++++ app/controllers/admin/Billers.php	(md5 3b37155e866d3f8211cbe3f555245dca)
+@@ -4021,8 +4021,46 @@
+ 
+         $data = $this->datatables->generate();
+         $data = json_decode($data);
++
++        // RILVEN (rilven-sync host patch): which runs on this page are confirmed for payroll, and
++        // whether they were edited after it. Only a confirmed run, as it stood then, goes to Rilven.
++        $this->load->library('rilven_payroll');
++        $rilvenRuns = array();
++        $rilvenChanged = array();
++        $rilvenDids = array();
++        foreach ($data->aaData as $r0) {
++            $rilvenDids[(int) $r0[11]] = TRUE;
++        }
++        if ($rilvenDids) {
++            $q = $this->db->query('SELECT id, rilven_status, rilven_fingerprint FROM ' . $this->db->dbprefix('daricxva')
++                . ' WHERE id IN (' . implode(',', array_keys($rilvenDids)) . ')');
++            foreach ($q->result() as $d) {
++                $rilvenRuns[(int) $d->id] = $d;
++                $rilvenChanged[(int) $d->id] = ((int) $d->rilven_status === 1)
++                    && $this->rilven_payroll->fingerprintOf($d->id) !== (string) $d->rilven_fingerprint;
++            }
++        }
++        $rilvenCanConfirm = $this->rilvenCanConfirmPayroll();
++
+         foreach ($data->aaData as $k => $r) {
+ 
++            $rilvenDid = (int) $r[11];
++            $rilvenConfirmed = isset($rilvenRuns[$rilvenDid]) && (int) $rilvenRuns[$rilvenDid]->rilven_status === 1;
++            $rilvenIsChanged = !empty($rilvenChanged[$rilvenDid]);
++            if ($rilvenConfirmed && !$rilvenIsChanged) {
++                $rilvenBadge = ' <span class="label label-success" title="Rilven-ში გაიგზავნება">Rilven &#10003;</span>';
++            } elseif ($rilvenConfirmed) {
++                $rilvenBadge = ' <span class="label label-warning" title="დადასტურების შემდეგ შეიცვალა -- ხელახლა დაადასტურეთ">Rilven: შეცვლილია</span>';
++            } else {
++                $rilvenBadge = ' <span class="label label-default" title="Rilven-ში არ იგზავნება">დასადასტურებელი</span>';
++            }
++            $rilven_confirm_link = "<a href='#' class='po' title='Rilven' data-content=\"<p>N" . $rilvenDid . ' -- ' . lang('r_u_sure') . "</p><a class='btn btn-success po-delete' href='" . site_url('admin/billers/rilven_confirm/') . $rilvenDid . "'>"
++                . lang('i_m_sure') . "</a> <button class='btn po-close'>" . lang('no') . "</button>\"  rel='popover'><i class=\"fa fa-check\"></i> "
++                . 'დადასტურება Rilven-ისთვის - N' . $rilvenDid . "</a>";
++            $rilven_reopen_link = "<a href='#' class='po' title='Rilven' data-content=\"<p>N" . $rilvenDid . ' -- ' . lang('r_u_sure') . "</p><a class='btn btn-warning po-delete' href='" . site_url('admin/billers/rilven_reopen/') . $rilvenDid . "'>"
++                . lang('i_m_sure') . "</a> <button class='btn po-close'>" . lang('no') . "</button>\"  rel='popover'><i class=\"fa fa-unlock\"></i> "
++                . 'გახსნა (Rilven) - N' . $rilvenDid . "</a>";
++
+             $detail_link = anchor('admin/billers/view/' . $r[1], '<i class="fa fa-edit"></i> ' . lang('customer_details'), 'data-toggle="modal" data-target="#myModal"');
+             $edit_link = anchor('admin/billers/edit_daricxva/' . $r[1], '<i class="fa fa-file-text-o"></i> ' . lang('უწყისის დათვალიერება'), 'class="sledit"');
+             $total_link = anchor('admin/billers/getSalaryReport/' . $r[1], '<i class="fa fa-file-text-o"></i> ' . lang('ჯამური უწყისი- N' . $r[11]), 'class="sledit"');
+@@ -4048,15 +4086,23 @@
+                 $action = $action . '<li>' . $total_link_jam . '</li>';
+ 				$action = $action . '<li>' . $total_link_jam_detall . '</li>';
+ 			
+-			$action = $action . '<li>' . $delete_all_link . '</li>';
+-            
++			if ($rilvenCanConfirm && (!$rilvenConfirmed || $rilvenIsChanged)) {
++				$action = $action . '<li>' . $rilven_confirm_link . '</li>';
++			}
++			if ($rilvenCanConfirm && $rilvenConfirmed) {
++				$action = $action . '<li>' . $rilven_reopen_link . '</li>';
++			}
++			// a confirmed run is payroll: it is opened again before it can be deleted
++			if (!$rilvenConfirmed) {
++				$action = $action . '<li>' . $delete_all_link . '</li>';
++			}
+ 
+             $action = $action . '</ul></div></div>';
+ 			
+             //$data->aaData[$k][7] = $r[12];
+             //$data->aaData[$k][8] = $r[10];
+             //$data->aaData[$k][9] = $r[11];
+-			$data->aaData[$k][2] = 'N'.$r[11]. ':'.$r[2];
++			$data->aaData[$k][2] = 'N'.$r[11]. ':'.$r[2] . $rilvenBadge;
+             $data->aaData[$k][11] = $action;
+ 
+             //$data->aaData[$k][7] = ($r[7] > 0) ? '<i class="fa fa-check-circle fa-lg darkGreen"></i>' : '<i class="fa fa-minus-circle fa-lg red"></i>';
+@@ -7082,6 +7128,16 @@
+             $id = $this->input->get('id');
+         }
+ 
++        // RILVEN: a run confirmed for payroll is not deleted -- the sync would quietly fall back to
++        // whatever else the month has. Opened again first, on purpose.
++        $rilvenRow = $this->companies_model->getdaricxvabyID($id);
++        if ($rilvenRow) {
++            $rilvenRun = $this->db->get_where('daricxva', array('id' => $rilvenRow->did), 1)->row();
++            if ($rilvenRun && (int) $rilvenRun->rilven_status === 1) {
++                $this->sma->send_json(array('error' => 1, 'msg' => 'N' . $rilvenRow->did . ' დადასტურებულია Rilven-ისთვის -- წაშლამდე ჯერ გახსენით'));
++            }
++        }
++
+         if ($this->companies_model->deleteDaricxva_all($id)) {
+             $this->sma->send_json(array('error' => 0, 'msg' => lang("ყველა განყოფილების დარიცხვა წაიშალა")));
+         } else {
+@@ -7089,6 +7145,73 @@
+         }
+     }
+ 
++    /**
++     * RILVEN (rilven-sync host patch): confirm a payroll run for Rilven. Only this run of its month
++     * stays confirmed, and it is remembered as it stands now (its fingerprint), so an edit made
++     * after this is not sent until confirmed again.
++     */
++    function rilven_confirm($did = NULL)
++    {
++        $this->sma->checkPermissions('salary', TRUE);
++        if (!$this->rilvenCanConfirmPayroll()) {
++            $this->sma->send_json(array('error' => 1, 'msg' => lang('access_denied')));
++        }
++        $did = (int) $did;
++        $run = $this->db->get_where('daricxva', array('id' => $did), 1)->row();
++        if (!$run) {
++            $this->sma->send_json(array('error' => 1, 'msg' => 'N' . $did . ' ვერ მოიძებნა'));
++        }
++        $this->load->library('rilven_payroll');
++        $fingerprint = $this->rilven_payroll->fingerprintOf($did);
++        if ($fingerprint === $did . ':0:0') {
++            $this->sma->send_json(array('error' => 1, 'msg' => 'N' . $did . ' ცარიელია -- დასადასტურებელი არაფერია'));
++        }
++        $table = $this->db->dbprefix('daricxva');
++        $this->db->query("UPDATE {$table} SET rilven_status = 0 WHERE id <> ? AND rilven_status = 1"
++            . " AND DATE_FORMAT(post_date, '%Y-%m') = DATE_FORMAT(?, '%Y-%m')", array($did, $run->post_date));
++        $this->db->update('daricxva', array(
++            'rilven_status' => 1,
++            'rilven_status_at' => date('Y-m-d H:i:s'),
++            'rilven_status_user' => $this->session->userdata('user_id'),
++            'rilven_fingerprint' => $fingerprint,
++        ), array('id' => $did));
++        $this->sma->send_json(array('error' => 0, 'msg' => 'N' . $did . ' დადასტურდა -- Rilven-ში გაიგზავნება'));
++    }
++
++    /**
++     * RILVEN: open a confirmed run again, to recalculate it. Nothing of the month is sent until a
++     * run is confirmed again; what Rilven already has stays as it is.
++     */
++    function rilven_reopen($did = NULL)
++    {
++        $this->sma->checkPermissions('salary', TRUE);
++        if (!$this->rilvenCanConfirmPayroll()) {
++            $this->sma->send_json(array('error' => 1, 'msg' => lang('access_denied')));
++        }
++        $did = (int) $did;
++        $this->db->update('daricxva', array(
++            'rilven_status' => 0,
++            'rilven_status_at' => date('Y-m-d H:i:s'),
++            'rilven_status_user' => $this->session->userdata('user_id'),
++        ), array('id' => $did));
++        $this->sma->send_json(array('error' => 0, 'msg' => 'N' . $did . ' გაიხსნა -- Rilven-ში აღარ იგზავნება, სანამ ხელახლა არ დადასტურდება'));
++    }
++
++    /** RILVEN: the owner, or a member of a group named in rilven_payroll_confirm_groups. */
++    private function rilvenCanConfirmPayroll()
++    {
++        if ($this->Owner) {
++            return TRUE;
++        }
++        $this->load->library('rilven_client');
++        foreach ((array) $this->rilven_client->cfg('rilven_payroll_confirm_groups', array()) as $group) {
++            if ($this->sma->in_group($group)) {
++                return TRUE;
++            }
++        }
++        return FALSE;
++    }
++
+     function delete_daricxva_cur($id = NULL)
+     {
+         $this->sma->checkPermissions(NULL, TRUE);
