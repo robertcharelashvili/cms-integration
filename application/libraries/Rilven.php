@@ -2065,7 +2065,9 @@ class Rilven
 
         while ($limit <= 0 || $out['cases'] < $limit) {
             $this->CI->db->select('s.id, o.rilven_id')->from($table . ' s')
-                ->join('rilven_outbox o', "o.entity = 'sale' AND o.external_id = CAST(s.id AS CHAR)", 'inner', FALSE)
+                // unescaped join, so CI adds no prefix: say it, as every other outbox join here does
+                ->join($this->CI->db->dbprefix . 'rilven_outbox o',
+                       "o.entity = 'sale' AND o.external_id = CAST(s.id AS CHAR)", 'inner', FALSE)
                 ->where('o.status', self::SENT)->where('o.rilven_id >', 0)
                 ->where('s.' . $column . ' >=', $from)->where('s.id >', $cursor)
                 ->order_by('s.id', 'ASC')->limit($batch);
