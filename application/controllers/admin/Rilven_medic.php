@@ -253,4 +253,219 @@ class Rilven_medic extends MY_Controller
     {
         $this->output->set_content_type('application/json')->set_output(json_encode($value));
     }
+
+    // ------------------------------------------------------------------ 2025-2026 history
+    //
+    // Past consumption brought over to Rilven as one write-off per month from the pharmacy, at the
+    // stock Rilven has from the RS purchases, the rest received there against 1620 at our cost.
+    // Products are Rilven's, through sma_rilven_product_link (several per medicine, each with how
+    // many of its pieces one of our units is). Run in this order, months oldest first:
+    //   admin/rilven_medic history_products
+    //   admin/rilven_medic history_opening
+    //   admin/rilven_medic history_month 2025-01 <employee tax code>
+
+    /** Rilven products for the medicines the history needs and has none for. */
+    public function history_products()
+    {
+        $this->cliOnly();
+        $this->config->set_item('rilven_timeout', 900);
+        $prefix = $this->db->dbprefix;
+        $rows = $this->db->query("SELECT p.id, p.name FROM {$prefix}products p
+              WHERE p.id IN (SELECT a.product_id FROM {$prefix}store_action a
+                              WHERE (a.posted_date < '2025-01-01')
+                                 OR (a.acount_id IN (3, 4) AND a.posted_date >= '2025-01-01' AND a.posted_date < ?)
+                              GROUP BY a.product_id
+                             HAVING SUM(CASE WHEN a.posted_date < '2025-01-01' THEN a.debet_count - a.credit_count ELSE 0 END) > 0
+                                 OR SUM(CASE WHEN a.posted_date >= '2025-01-01' THEN a.credit_count - a.debet_count ELSE 0 END) > 0)
+                AND p.id NOT IN (SELECT product_id FROM {$prefix}rilven_product_link)", array($this->historyEnd()))->result();
+        $this->say(count($rows) . ' medicines have no Rilven product');
+        $created = 0;
+        foreach (array_chunk($rows, 200) as $chunk) {
+            $items = array();
+            foreach ($chunk as $r) {
+                $items[] = array('code' => 'cms-' . $r->id, 'name' => $this->cleanName($r->name, $r->id));
+            }
+            $answer = $this->rilven_client->post('/medic-consumption/history/products', array(
+                'accountPlanMapId' => (int) $this->config->item('rilven_medic_history_account_plan_map_id'),
+                'categoryId'       => (int) $this->config->item('rilven_medic_history_category_id'),
+                'measureId'        => (int) $this->config->item('rilven_medic_history_measure_id'),
+                'vatType'          => (int) $this->config->item('rilven_medic_history_vat_type'),
+                'items'            => $items,
+            ));
+            if (!$answer['ok']) {
+                $this->say('FAILED: ' . $answer['error']);
+                return;
+            }
+            foreach ($answer['data']['items'] as $it) {
+                $this->db->query('INSERT IGNORE INTO ' . $prefix . 'rilven_product_link (product_id, rilven_sku_id, factor, source)'
+                    . ' VALUES (?, ?, 1, ?)', array((int) substr($it['code'], 4), (int) $it['assetSkuId'], 'created'));
+                $created += $it['created'] ? 1 : 0;
+            }
+            $this->say('  ' . count($items) . ' sent');
+        }
+        $this->say($created . ' created in Rilven, links saved');
+    }
+
+    /** Our stock on 2024-12-31, all warehouses, onto the Rilven pharmacy on 2025-01-01, Kt 1620. */
+    public function history_opening($dry = '')
+    {
+        $this->cliOnly();
+        $this->config->set_item('rilven_timeout', 1800);
+        $prefix = $this->db->dbprefix;
+        $rows = $this->db->query("SELECT a.product_id, SUM(a.debet_count - a.credit_count) qty, SUM(a.debet_amount - a.credit_amount) amt
+              FROM {$prefix}store_action a WHERE a.posted_date < '2025-01-01'
+             GROUP BY a.product_id HAVING qty > 0 AND amt > 0")->result();
+        $links = $this->links();
+        $lines = array();
+        $missing = 0;
+        $total = 0;
+        foreach ($rows as $r) {
+            if (empty($links[(int) $r->product_id])) {
+                $missing++;
+                continue;
+            }
+            $first = $links[(int) $r->product_id][0];
+            $lines[] = array('assetSkuId' => $first['assetSkuId'], 'factor' => $first['factor'],
+                             'quantity' => $this->dec($r->qty), 'amount' => (int) round($r->amt * 10000));
+            $total += $r->amt;
+        }
+        $this->say(sprintf('%d products, %.2f GEL; %d without a Rilven product', count($lines), $total, $missing));
+        if ($missing > 0) {
+            $this->say('run history_products first');
+            return;
+        }
+        if ($dry === 'dry') {
+            return;
+        }
+        foreach (array_chunk($lines, 500) as $i => $chunk) {
+            $answer = $this->rilven_client->put('/medic-consumption/history/opening', array(
+                'externalId'         => 'history-opening-2025-01-01-' . ($i + 1),
+                'warehouseId'        => (int) $this->config->item('rilven_medic_history_warehouse_id'),
+                'date'               => '2025-01-01 06:00:00',
+                'counterAccountCode' => '1620',
+                'lines'              => $chunk,
+            ));
+            $this->say('  part ' . ($i + 1) . ': ' . ($answer['ok']
+                ? $answer['data']['status'] . ' document ' . $answer['data']['waybillId'] . ', ' . $answer['data']['lines'] . ' lines'
+                : 'FAILED ' . $answer['error'] . ' ' . json_encode(isset($answer['data']['meta']) ? $answer['data']['meta'] : array())));
+            if (!$answer['ok']) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * One month written off from the Rilven pharmacy: what was used in treatment (type 4, and the
+     * departments' bulk write-offs, type 3), and apart from it the expired (warehouse 81) and the
+     * inventory shortage (112), each its own document and reason.
+     */
+    public function history_month($month = '', $employeeTaxCode = '', $dry = '')
+    {
+        $this->cliOnly();
+        if (!preg_match('/^\d{4}-\d{2}$/', $month) || $employeeTaxCode === '') {
+            $this->say('usage: admin/rilven_medic history_month <YYYY-MM> <employee tax code> [dry]');
+            return;
+        }
+        $this->config->set_item('rilven_timeout', 1800);
+        $from = $month . '-01';
+        $to = date('Y-m-d', strtotime($from . ' +1 month'));
+        $last = date('Y-m-d', strtotime($to . ' -1 day'));
+        $prefix = $this->db->dbprefix;
+        $groups = array(
+            'treatment' => array(7, "(a.acount_id = 4 OR (a.acount_id = 3 AND a.warehouse_id NOT IN (81, 112)))"),
+            'expired'   => array(2, "(a.acount_id = 3 AND a.warehouse_id = 81)"),
+            'inventory' => array(5, "(a.acount_id = 3 AND a.warehouse_id = 112)"),
+        );
+        $links = $this->links();
+        foreach ($groups as $key => $g) {
+            $rows = $this->db->query("SELECT a.product_id, MAX(p.name) name, SUM(a.credit_count - a.debet_count) qty,
+                       SUM(a.credit_amount - a.debet_amount) amt
+                  FROM {$prefix}store_action a LEFT JOIN {$prefix}products p ON p.id = a.product_id
+                 WHERE a.posted_date >= ? AND a.posted_date < ? AND {$g[1]}
+                 GROUP BY a.product_id HAVING qty > 0", array($from, $to))->result();
+            if (empty($rows)) {
+                $this->say("$month $key: nothing");
+                continue;
+            }
+            $lines = array();
+            $missing = array();
+            $total = 0;
+            foreach ($rows as $r) {
+                $l = isset($links[(int) $r->product_id]) ? $links[(int) $r->product_id] : array();
+                if (empty($l)) {
+                    $missing[] = $r->product_id;
+                    continue;
+                }
+                $lines[] = array('label' => mb_substr((string) $r->name, 0, 200), 'quantity' => $this->dec($r->qty),
+                                 'amount' => max(0, (int) round($r->amt * 10000)), 'skus' => $l);
+                $total += $r->amt;
+            }
+            $this->say(sprintf('%s %s: %d lines, %.2f GEL%s', $month, $key, count($lines), $total,
+                $missing ? '; NO Rilven product for ' . implode(',', array_slice($missing, 0, 10)) : ''));
+            if ($missing || $dry === 'dry') {
+                continue;
+            }
+            $answer = $this->rilven_client->put('/medic-consumption/history/month', array(
+                'externalId'         => 'history-' . $month . '-' . $key,
+                'warehouseId'        => (int) $this->config->item('rilven_medic_history_warehouse_id'),
+                'date'               => $last . ' 12:00:00',
+                'receiptDate'        => $from . ' 12:00:00',
+                'counterAccountCode' => '1620',
+                'reason'             => $g[0],
+                'employeeTaxCode'    => $employeeTaxCode,
+                'comment'            => 'CMS ' . $month . ' ' . $key,
+                'lines'              => $lines,
+            ));
+            if (!$answer['ok']) {
+                $this->say('  FAILED ' . $answer['error'] . ' ' . json_encode(isset($answer['data']['meta']) ? $answer['data']['meta'] : array(), JSON_UNESCAPED_UNICODE));
+                return;
+            }
+            $d = $answer['data'];
+            $this->say(sprintf('  %s: write-off %s (%.2f from stock and receipt), receipt %s (%d lines, %.2f at our cost)',
+                $d['status'], $d['waybillId'], $d['writtenOff'] / 10000, $d['receiptWaybillId'] ? $d['receiptWaybillId'] : '-',
+                $d['receivedLines'], $d['received'] / 10000));
+        }
+    }
+
+    /** product_id => [{assetSkuId, factor}], purchase-learned first, the most bought first. */
+    private function links()
+    {
+        $out = array();
+        foreach ($this->db->query('SELECT product_id, rilven_sku_id, factor FROM ' . $this->db->dbprefix('rilven_product_link')
+                . " ORDER BY product_id, FIELD(source, 'purchase', 'name', 'created'), purchases DESC, rilven_sku_id")->result() as $r) {
+            $out[(int) $r->product_id][] = array('assetSkuId' => (int) $r->rilven_sku_id, 'factor' => $this->dec($r->factor));
+        }
+        return $out;
+    }
+
+    /** The history covers up to the end of the last whole month. */
+    private function historyEnd()
+    {
+        return date('Y-m-01');
+    }
+
+    private function dec($v)
+    {
+        return rtrim(rtrim(number_format((float) $v, 6, '.', ''), '0'), '.');
+    }
+
+    /** Our names carry the unit twice and underscores: "ანალგინი_ ამპულა ამპულა" becomes "ანალგინი ამპულა". */
+    private function cleanName($name, $id)
+    {
+        $n = trim(preg_replace('/\s+/u', ' ', str_replace('_', ' ', (string) $name)));
+        $words = explode(' ', $n);
+        $k = count($words);
+        if ($k > 2 && $words[$k - 1] === $words[$k - 2]) {
+            array_pop($words);
+        }
+        $n = trim(implode(' ', $words));
+        return $n === '' ? 'CMS product ' . $id : mb_substr($n, 0, 250);
+    }
+
+    private function cliOnly()
+    {
+        if (!is_cli()) {
+            show_404();
+        }
+    }
 }
