@@ -497,6 +497,33 @@ class Rilven_sale
     }
 
     /** A decimal from the CMS as the integer Rilven stores: the value ×10000. */
+    /**
+     * A line's performers as Rilven takes them (WaybillServicePerformerDTO). Public for the
+     * backfill, which loads them onto cases sent before lines carried them.
+     */
+    public function performersPayload($list)
+    {
+        $performers = array();
+        foreach ((array) $list as $p) {
+            $one = array('employeeTaxCode' => $p['taxCode'], 'employeeName' => $p['name']);
+            // the CMS owns the staff list: a doctor Rilven does not know yet is created there
+            // from sma_companies (by personal number only, never by name)
+            if ($this->client->cfg('rilven_performer_create_missing', TRUE)) {
+                $one['createIfMissing'] = TRUE;
+                if ($p['phone'] !== '') { $one['employeePhone'] = $this->clip($p['phone'], 50); }
+                if ($p['email'] !== '') { $one['employeeEmail'] = $this->clip($p['email'], 255); }
+            }
+            if ($p['share'] !== NULL) {
+                $one['sharePercent'] = (int) $p['share'];
+            }
+            if ($p['role'] !== '') {
+                $one['role'] = $this->clip($p['role'], 100);
+            }
+            $performers[] = $one;
+        }
+        return $performers;
+    }
+
     private function money($value)
     {
         return (int) round(((float) $value) * 10000);
@@ -941,25 +968,7 @@ class Rilven_sale
                 $serviceItems[count($serviceItems) - 1]['warehouseId'] = (int) $lineWarehouseId;
             }
             if ($line['performers'] !== NULL) {
-                $performers = array();
-                foreach ($line['performers'] as $p) {
-                    $one = array('employeeTaxCode' => $p['taxCode'], 'employeeName' => $p['name']);
-                    // the CMS owns the staff list: a doctor Rilven does not know yet is created
-                    // there from sma_companies (by personal number only, never by name)
-                    if ($this->client->cfg('rilven_performer_create_missing', TRUE)) {
-                        $one['createIfMissing'] = TRUE;
-                        if ($p['phone'] !== '') { $one['employeePhone'] = $this->clip($p['phone'], 50); }
-                        if ($p['email'] !== '') { $one['employeeEmail'] = $this->clip($p['email'], 255); }
-                    }
-                    if ($p['share'] !== NULL) {
-                        $one['sharePercent'] = (int) $p['share'];
-                    }
-                    if ($p['role'] !== '') {
-                        $one['role'] = $this->clip($p['role'], 100);
-                    }
-                    $performers[] = $one;
-                }
-                $serviceItems[count($serviceItems) - 1]['performers'] = $performers;
+                $serviceItems[count($serviceItems) - 1]['performers'] = $this->performersPayload($line['performers']);
             }
         }
 

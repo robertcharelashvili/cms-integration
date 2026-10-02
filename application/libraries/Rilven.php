@@ -2043,6 +2043,81 @@ class Rilven
         return $row;
     }
 
+    /**
+     * Load who performed each line onto cases already in Rilven, oldest first, from a date.
+     *
+     * Not a re-send. A sent case is usually posted, and re-sending it means unpost, rewrite,
+     * post -- for 135 000 cases, to change nothing on the ledger. Rilven's
+     * /waybill/service-performers sets performers by line code whatever the status, 50 cases a
+     * call. Resumable: the last case done is kept in rilven_state, so a stopped run carries on.
+     *
+     * @return array counts: cases, lines, missing (codes Rilven has no line for), refused, calls
+     */
+    public function backfillPerformers($from, $limit = 0, $restart = FALSE)
+    {
+        $out = array('ok' => TRUE, 'cases' => 0, 'lines' => 0, 'missing' => 0, 'refused' => 0,
+                     'calls' => 0, 'last' => 0, 'error' => '', 'refusals' => array());
+        $stateKey = 'performers_backfill_' . preg_replace('/[^0-9]/', '', $from);
+        $cursor = $restart ? 0 : (int) $this->client->state($stateKey, 0);
+        $table  = (string) $this->client->cfg('rilven_sale_source_table', 'sales');
+        $column = (string) $this->client->cfg('rilven_sale_date_column', 'date');
+        $batch  = 50;
+
+        while ($limit <= 0 || $out['cases'] < $limit) {
+            $this->CI->db->select('s.id, o.rilven_id')->from($table . ' s')
+                ->join('rilven_outbox o', "o.entity = 'sale' AND o.external_id = CAST(s.id AS CHAR)", 'inner', FALSE)
+                ->where('o.status', self::SENT)->where('o.rilven_id >', 0)
+                ->where('s.' . $column . ' >=', $from)->where('s.id >', $cursor)
+                ->order_by('s.id', 'ASC')->limit($batch);
+            $this->applySaleScope('s.');
+            $cases = $this->CI->db->get()->result();
+            if (empty($cases)) {
+                break;
+            }
+
+            $waybills = array();
+            foreach ($cases as $case) {
+                $lines = array();
+                foreach ($this->saleItems($case->id) as $item) {
+                    if (isset($item->performers) && isset($item->id)) {
+                        $lines[] = array('code' => (string) $item->id,
+                                         'performers' => $this->sale->performersPayload($item->performers));
+                    }
+                }
+                if (!empty($lines)) {
+                    $waybills[] = array('waybillId' => (int) $case->rilven_id, 'lines' => $lines);
+                }
+            }
+
+            if (!empty($waybills)) {
+                $answer = $this->client->put('/waybill/service-performers', array('waybills' => $waybills));
+                $out['calls']++;
+                if (!$answer['ok']) {
+                    // stop where we are: the cursor still points before this batch
+                    $out['ok'] = FALSE;
+                    $out['error'] = $answer['error'];
+                    return $out;
+                }
+                $data = isset($answer['data']) ? $answer['data'] : array();
+                $out['lines']   += isset($data['updated']) ? (int) $data['updated'] : 0;
+                $out['missing'] += isset($data['missing']) ? (int) $data['missing'] : 0;
+                foreach (isset($data['refused']) ? (array) $data['refused'] : array() as $r) {
+                    $out['refused']++;
+                    if (count($out['refusals']) < 50) {
+                        $out['refusals'][] = $r;
+                    }
+                }
+            }
+
+            $last = end($cases);
+            $cursor = (int) $last->id;
+            $this->client->setState($stateKey, $cursor);
+            $out['cases'] += count($cases);
+            $out['last'] = $cursor;
+        }
+        return $out;
+    }
+
     /** The service lines of one case, subservices left out. */
     private function saleItems($saleId)
     {

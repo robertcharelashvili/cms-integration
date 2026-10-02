@@ -132,6 +132,29 @@ class Rilven_sync extends MY_Controller
             $m['ok'] ? (!empty($m['sent']) ? 'sent' : 'unchanged') : 'REFUSED: ' . $m['error']));
     }
 
+    /**
+     * Load who performed each line onto cases already in Rilven, from a date. Resumable; "restart"
+     * starts over from the date.
+     *
+     *     php index.php admin/rilven_sync performers 2025-01-01
+     */
+    public function performers($from = '', $restart = '')
+    {
+        if (!is_cli()) { show_404(); }
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) {
+            $this->say('usage: admin/rilven_sync performers YYYY-MM-DD [restart]');
+            return;
+        }
+        $limit = (int) $this->input->get('limit');
+        $m = $this->rilven->backfillPerformers($from, $limit, $restart === 'restart');
+        $this->say(sprintf('[%s] rilven: performers from %s cases=%d lines=%d missing=%d refused=%d calls=%d last=%d %s',
+            date('Y-m-d H:i:s'), $from, $m['cases'], $m['lines'], $m['missing'], $m['refused'], $m['calls'], $m['last'],
+            $m['ok'] ? 'done' : 'STOPPED: ' . $m['error']));
+        foreach ($m['refusals'] as $r) {
+            $this->say('  refused ' . json_encode($r, JSON_UNESCAPED_UNICODE));
+        }
+    }
+
     /** Top the queue up and send nothing, for a first look at how much there is. */
     public function backfill()
     {
