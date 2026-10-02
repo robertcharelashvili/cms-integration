@@ -1,0 +1,38 @@
+--- app/controllers/admin/Medical_costs.php	2026-10-02 13:44:28.250770813 +0400
++++ app/controllers/admin/Medical_costs.php	2026-10-02 13:54:10.657671377 +0400
+@@ -13,6 +13,8 @@
+         $this->lang->admin_load('medical_costs', $this->Settings->user_language);
+         $this->load->library('form_validation');
+         $this->load->admin_model('medical_costs_model');
++        // saves, edits and deletes go through Rilven: the write-off there or nothing (rilven_medic_enabled)
++        $this->load->admin_model('rilven_medic_model');
+         $this->digital_upload_path = 'files/';
+         $this->upload_path = 'assets/uploads/';
+         $this->thumbs_path = 'assets/uploads/thumbs/';
+@@ -728,7 +730,7 @@
+ 			//$this->sma->print_arrays($_POST);
+         }
+ 
+-        if ($this->form_validation->run() == true && $this->medical_costs_model->addSale($data, $products, $page_number, $colomn, $add_template, $template_name)) {
++        if ($this->form_validation->run() == true && $this->rilven_medic_model->addSale($data, $products, $page_number, $colomn, $add_template, $template_name)) {
+             $this->session->set_userdata('remove_slls', 1);
+ 
+ 			$this->session->set_flashdata('message', lang("სამედიცინო ხარჯები დამატებულია"));
+@@ -1418,7 +1420,7 @@
+           //  $this->sma->print_arrays($products);
+         }
+ 
+-        if ($this->form_validation->run() == true && $this->medical_costs_model->updateSale($id, $data, $products)) {
++        if ($this->form_validation->run() == true && $this->rilven_medic_model->updateSale($id, $data, $products)) {
+ 
+ 			$this->session->set_userdata('remove_slls', 1);
+ 			$this->session->set_flashdata('message', lang("სამედიცინო ხარეჯები დარედაქტირდა"));
+@@ -2901,7 +2903,7 @@
+             admin_redirect(isset($_SERVER["HTTP_REFERER"]) ? $_SERVER["HTTP_REFERER"] : 'welcome');
+         }
+ 
+-        if ($this->medical_costs_model->deleteSale($id)) {
++        if ($this->rilven_medic_model->deleteSale($id)) {
+             if ($this->input->is_ajax_request()) {
+                 $this->sma->send_json(array('error' => 0, 'msg' => lang("medical_costs_deleted")));
+             }

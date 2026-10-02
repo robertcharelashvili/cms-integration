@@ -679,6 +679,14 @@ $config['rilven_performer_role_table']      = 'positions';
 // one with no personal number still refuses the case
 $config['rilven_performer_create_missing']  = TRUE;
 
+// Medicines used on a case are written off in Rilven as they are saved here (models/admin/
+// Rilven_medic_model.php): Rilven checks the department's stock, refuses the whole document when
+// one drug is short, posts the write-off otherwise; without Rilven the save is blocked.
+// OFF until the products are mapped and staff are trained.
+$config['rilven_medic_enabled']                 = FALSE;
+// who answers for the write-off when the service line names no performer (personal number)
+$config['rilven_medic_default_employee_tax_code'] = '';
+
 // Which column dates a case, for the window above.
 $config['rilven_sale_date_column'] = 'date';
 
