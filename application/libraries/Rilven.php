@@ -2052,7 +2052,157 @@ class Rilven
             ->order_by('i.id', 'ASC');
         $this->applyWhere($this->client->cfg('rilven_sale_item_where', array()), 'i.');
 
-        return $this->CI->db->get()->result();
+        $items = $this->CI->db->get()->result();
+        if ($this->client->cfg('rilven_sale_performers', FALSE)) {
+            $this->attachPerformers($items);
+        }
+        return $items;
+    }
+
+    /**
+     * Who performed each service line: ->performers on every item, a list of
+     * array('taxCode', 'name', 'share', 'role').
+     *
+     * Two shapes in the CMS, told apart by the product:
+     *   - one person (products.brigada <> 1): sale_items.serial_no is their staff id;
+     *   - a team (products.brigada = 1): one salary_action row per member, by sale_item_id.
+     * A staff id is a companies.id, whose vat_no is the personal number Rilven finds the employee
+     * by -- the same join payroll makes. The name travels as the fallback for a card with no
+     * usable number.
+     *
+     * Shares: from the amount column of salary_action when one is configured (each member's
+     * amount over the line's total), otherwise left out so Rilven shares the line equally. A
+     * single performer is always 100%.
+     */
+    private function attachPerformers($items)
+    {
+        if (empty($items)) {
+            return;
+        }
+        $products   = (string) $this->client->cfg('rilven_performer_product_table', 'products');
+        $teamColumn = (string) $this->client->cfg('rilven_performer_team_column', 'brigada');
+        $soloColumn = (string) $this->client->cfg('rilven_performer_solo_column', 'serial_no');
+        $actions    = (string) $this->client->cfg('rilven_performer_team_table', 'salary_action');
+        $amountCol  = (string) $this->client->cfg('rilven_performer_amount_column', '');
+        $roleCol    = (string) $this->client->cfg('rilven_performer_role_column', '');
+        $staffTable = (string) $this->client->cfg('rilven_source_table', 'companies');
+
+        $productIds = array();
+        foreach ($items as $item) {
+            $item->performers = array();
+            if (isset($item->product_id) && (int) $item->product_id > 0) {
+                $productIds[(int) $item->product_id] = TRUE;
+            }
+        }
+        $team = array();
+        if (!empty($productIds)) {
+            foreach ($this->CI->db->select('id, ' . $teamColumn . ' AS team', FALSE)->from($products)
+                         ->where_in('id', array_keys($productIds))->get()->result() as $p) {
+                $team[(int) $p->id] = ((int) $p->team === 1);
+            }
+        }
+
+        // the members of every team line, in one query
+        $teamLineIds = array();
+        foreach ($items as $item) {
+            if (!empty($team[(int) $item->product_id]) && isset($item->id)) {
+                $teamLineIds[] = (int) $item->id;
+            }
+        }
+        $members = array();
+        if (!empty($teamLineIds)) {
+            $select = 'sale_item_id, staff_id'
+                . ($amountCol !== '' ? ', ' . $amountCol . ' AS amount' : '')
+                . ($roleCol !== '' ? ', ' . $roleCol . ' AS role' : '');
+            foreach ($this->CI->db->select($select, FALSE)->from($actions)
+                         ->where_in('sale_item_id', $teamLineIds)->order_by('id', 'ASC')->get()->result() as $a) {
+                if ((int) $a->staff_id > 0) {
+                    $members[(int) $a->sale_item_id][] = $a;
+                }
+            }
+        }
+
+        // every staff id we will name, resolved to a personal number and a name once
+        $staffIds = array();
+        foreach ($items as $item) {
+            if (!empty($team[(int) $item->product_id])) {
+                foreach (isset($members[(int) $item->id]) ? $members[(int) $item->id] : array() as $a) {
+                    $staffIds[(int) $a->staff_id] = TRUE;
+                }
+            } elseif (isset($item->$soloColumn) && (int) $item->$soloColumn > 0) {
+                $staffIds[(int) $item->$soloColumn] = TRUE;
+            }
+        }
+        $staff = array();
+        if (!empty($staffIds)) {
+            foreach ($this->CI->db->select('id, TRIM(vat_no) AS tax_code, name', FALSE)->from($staffTable)
+                         ->where_in('id', array_keys($staffIds))->get()->result() as $c) {
+                $staff[(int) $c->id] = $c;
+            }
+        }
+
+        foreach ($items as $item) {
+            if (!empty($team[(int) $item->product_id])) {
+                $list = isset($members[(int) $item->id]) ? $members[(int) $item->id] : array();
+                // the same person twice on one line is one performer, their amounts together
+                $byStaff = array();
+                foreach ($list as $a) {
+                    $sid = (int) $a->staff_id;
+                    if (!isset($byStaff[$sid])) {
+                        $byStaff[$sid] = array('amount' => 0.0, 'role' => isset($a->role) ? (string) $a->role : '');
+                    }
+                    $byStaff[$sid]['amount'] += isset($a->amount) ? (float) $a->amount : 0.0;
+                }
+                $total = 0.0;
+                foreach ($byStaff as $m) {
+                    $total += $m['amount'];
+                }
+                $shares = $this->shares($byStaff, $amountCol !== '' && $total > 0 ? $total : 0.0);
+                foreach ($byStaff as $sid => $m) {
+                    $item->performers[] = $this->performer($staff, $sid, $shares[$sid], $m['role']);
+                }
+            } elseif (isset($item->$soloColumn) && (int) $item->$soloColumn > 0) {
+                $item->performers[] = $this->performer($staff, (int) $item->$soloColumn, 1000000, '');
+            }
+        }
+    }
+
+    /**
+     * Each member's share, ×10000 of a percent and adding up to exactly 1 000 000, or NULL for
+     * all of them when there are no amounts to share by (Rilven then shares equally).
+     */
+    private function shares($byStaff, $total)
+    {
+        $out = array();
+        if ($total <= 0) {
+            foreach ($byStaff as $sid => $m) {
+                $out[$sid] = NULL;
+            }
+            return $out;
+        }
+        $given = 0;
+        $first = NULL;
+        foreach ($byStaff as $sid => $m) {
+            $out[$sid] = (int) floor($m['amount'] / $total * 1000000);
+            $given += $out[$sid];
+            if ($first === NULL) {
+                $first = $sid;
+            }
+        }
+        // the rounding left over goes to the first, so the line is shared out exactly
+        $out[$first] += 1000000 - $given;
+        return $out;
+    }
+
+    private function performer($staff, $sid, $share, $role)
+    {
+        $c = isset($staff[$sid]) ? $staff[$sid] : NULL;
+        return array(
+            'taxCode' => $c ? (string) $c->tax_code : '',
+            'name'    => $c ? (string) $c->name : '',
+            'share'   => $share,
+            'role'    => $role,
+        );
     }
 
     /**

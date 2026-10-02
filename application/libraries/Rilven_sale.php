@@ -456,6 +456,11 @@ class Rilven_sale
         // them. It is a trace back to the row that produced this line at the time it was sent.
         $out['lineId'] = isset($item->id) && (int) $item->id > 0 ? (int) $item->id : NULL;
 
+        // Who performed it, when the register is told to send that (rilven_sale_performers):
+        // attached by Rilven::attachPerformers. Absent means "not sent", which Rilven reads as
+        // "leave the performers as they are" -- not as "nobody".
+        $out['performers'] = isset($item->performers) && is_array($item->performers) ? $item->performers : NULL;
+
         // The room this one service was performed in. A case collects an X-ray from radiology, a
         // consultation from a doctor's room and a test from the laboratory, and this register says
         // so per line beside the case's own warehouse. NULL means "wherever the case was", which
@@ -934,6 +939,20 @@ class Rilven_sale
             }
             if ($lineWarehouseId !== NULL) {
                 $serviceItems[count($serviceItems) - 1]['warehouseId'] = (int) $lineWarehouseId;
+            }
+            if ($line['performers'] !== NULL) {
+                $performers = array();
+                foreach ($line['performers'] as $p) {
+                    $one = array('employeeTaxCode' => $p['taxCode'], 'employeeName' => $p['name']);
+                    if ($p['share'] !== NULL) {
+                        $one['sharePercent'] = (int) $p['share'];
+                    }
+                    if ($p['role'] !== '') {
+                        $one['role'] = $this->clip($p['role'], 100);
+                    }
+                    $performers[] = $one;
+                }
+                $serviceItems[count($serviceItems) - 1]['performers'] = $performers;
             }
         }
 

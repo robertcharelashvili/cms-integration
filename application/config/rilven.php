@@ -659,6 +659,21 @@ $config['rilven_sale_from'] = '2025-01-01';
 $config['rilven_sale_source_table'] = 'sales';
 $config['rilven_sale_item_table']   = 'sale_items';
 
+// Who performed each service line, sent with the line (Rilven tb_waybill_service_item_employee).
+// OFF until the column names below are confirmed against this CMS. One person: products.brigada <> 1
+// and sale_items.serial_no is their staff id; a team: products.brigada = 1 and one salary_action row
+// per member by sale_item_id. Staff ids are companies.id; Rilven finds them by vat_no (personal
+// number), as payroll does. An unknown performer refuses the case in Rilven, so check the names first.
+$config['rilven_sale_performers']           = FALSE;
+$config['rilven_performer_product_table']   = 'products';
+$config['rilven_performer_team_column']     = 'brigada';
+$config['rilven_performer_solo_column']     = 'serial_no';
+$config['rilven_performer_team_table']      = 'salary_action';
+// salary_action column with each member's amount, to share the line by; '' = equal shares
+$config['rilven_performer_amount_column']   = '';
+// salary_action column with the member's role; '' = no role
+$config['rilven_performer_role_column']     = '';
+
 // Which column dates a case, for the window above.
 $config['rilven_sale_date_column'] = 'date';
 
