@@ -1,6 +1,7 @@
 <?php defined('BASEPATH') OR exit('No direct script access allowed'); ?>
 <?php
-// Which Rilven product each medicine used here is written off as (sma_rilven_product_map).
+// Which Rilven products each medicine used here is written off as (sma_rilven_product_link): one
+// medicine bought from several suppliers is several products there, each with its own factor.
 // Rilven keeps no map of this catalogue; this screen is the only place it is kept.
 $e = function ($v) { return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8'); };
 $link = function ($changes) use ($show, $days, $q, $page) {
@@ -55,8 +56,7 @@ $link = function ($changes) use ($show, $days, $q, $page) {
                     <th>მედიკამენტი (CMS)</th>
                     <th style="width:80px">ერთეული</th>
                     <th style="width:80px">გამოყ.</th>
-                    <th>Rilven-ის პროდუქტი</th>
-                    <th style="width:80px">კოეფ.</th>
+                    <th colspan="2">Rilven-ის პროდუქტები (× კოეფიციენტი)</th>
                     <th style="width:170px"></th>
                 </tr>
                 </thead>
@@ -69,21 +69,23 @@ $link = function ($changes) use ($show, $days, $q, $page) {
                         </td>
                         <td><?= $e($r->unit) ?></td>
                         <td><?= (int) $r->used ?><br><span class="rvm-muted"><?= $e(substr((string) $r->last_used, 0, 10)) ?></span></td>
-                        <td class="rvm-target">
-                            <?php if ($r->rilven_sku_id): ?>
-                                <span class="rvm-mapped"><i class="fa fa-check"></i>
-                                    <?= $e($r->rilven_name !== NULL && $r->rilven_name !== '' ? $r->rilven_name : ('#' . $r->rilven_sku_id)) ?></span>
-                                <br><span class="rvm-muted">#<?= (int) $r->rilven_sku_id ?> <?= $e($r->rilven_code) ?> · <?= $e($r->rilven_measure) ?></span>
-                            <?php else: ?>
-                                <span class="rvm-muted">—</span>
-                            <?php endif; ?>
+                        <td class="rvm-target" colspan="2">
+                            <?php foreach (isset($links[(int) $r->product_id]) ? $links[(int) $r->product_id] : array() as $l):
+                                $k = isset($skus[(int) $l->rilven_sku_id]) ? $skus[(int) $l->rilven_sku_id] : array(); ?>
+                                <div class="rvm-link" data-sku="<?= (int) $l->rilven_sku_id ?>">
+                                    <span class="rvm-mapped"><i class="fa fa-check"></i>
+                                        <?= $e(isset($k['name']) ? $k['name'] : ('#' . $l->rilven_sku_id)) ?></span>
+                                    <span class="rvm-muted">#<?= (int) $l->rilven_sku_id ?> · <?= $e(isset($k['measure']) ? $k['measure'] : '') ?>
+                                        · ×<?= $e(rtrim(rtrim((string) $l->factor, '0'), '.')) ?>
+                                        <?php if (!empty($k['packSize']) && (int) $k['packSize'] > 1): ?> · შეფ. <?= (int) $k['packSize'] ?><?php endif; ?>
+                                        · <?= $e($l->source) ?></span>
+                                    <a href="#" class="rvm-delete" title="წაშლა"><i class="fa fa-times"></i></a>
+                                </div>
+                            <?php endforeach; ?>
+                            <?php if (empty($links[(int) $r->product_id])): ?><span class="rvm-muted rvm-none">—</span><?php endif; ?>
                         </td>
-                        <td class="rvm-factor"><?= $r->rilven_sku_id ? $e(rtrim(rtrim((string) $r->factor, '0'), '.')) : '' ?></td>
                         <td>
-                            <button type="button" class="btn btn-xs btn-primary rvm-edit"><?= $r->rilven_sku_id ? 'შეცვლა' : 'დაკავშირება' ?></button>
-                            <?php if ($r->rilven_sku_id): ?>
-                                <button type="button" class="btn btn-xs btn-danger rvm-delete">წაშლა</button>
-                            <?php endif; ?>
+                            <button type="button" class="btn btn-xs btn-primary rvm-edit">დამატება</button>
                         </td>
                     </tr>
                 <?php endforeach; ?>
@@ -135,7 +137,7 @@ $(function () {
             '<input type="text" class="form-control rvm-key" style="width:340px" placeholder="Rilven-ის პროდუქტის დასახელება ან კოდი"> ' +
             '<button type="button" class="btn btn-default rvm-find">ძებნა</button> ' +
             '<label style="margin-left:14px">კოეფიციენტი</label> ' +
-            '<input type="text" class="form-control rvm-f" style="width:90px" value="' + esc(row.find('.rvm-factor').text().trim() || '1') + '"> ' +
+            '<input type="text" class="form-control rvm-f" style="width:90px" value="1"> ' +
             '<button type="button" class="btn btn-success rvm-save" disabled>შენახვა</button> ' +
             '<button type="button" class="btn btn-link rvm-cancel">გაუქმება</button>' +
             '<span class="rvm-msg" style="margin-left:10px"></span></div>' +
@@ -185,25 +187,23 @@ $(function () {
         post(saveUrl, {product_id: id, rilven_sku_id: btn.data('sku'), factor: editor.find('.rvm-f').val()}).done(function (r) {
             if (!r.ok) { editor.find('.rvm-msg').html('<span class="rvm-warn">' + esc(r.error) + '</span>'); btn.prop('disabled', false); return; }
             var row = $('#rvm-row-' + id);
-            row.find('.rvm-target').html('<span class="rvm-mapped"><i class="fa fa-check"></i> ' + esc(r.row.rilven_name) + '</span><br><span class="rvm-muted">#' +
-                esc(r.row.rilven_sku_id) + ' ' + esc(r.row.rilven_code) + ' · ' + esc(r.row.rilven_measure) + '</span>');
-            row.find('.rvm-factor').text(r.row.factor);
-            row.find('.rvm-edit').text('შეცვლა');
-            if (!row.find('.rvm-delete').length) { row.find('.rvm-edit').after(' <button type="button" class="btn btn-xs btn-danger rvm-delete">წაშლა</button>'); }
+            row.find('.rvm-none').remove();
+            row.find('.rvm-link[data-sku="' + r.row.rilven_sku_id + '"]').remove();
+            row.find('.rvm-target').append('<div class="rvm-link" data-sku="' + esc(r.row.rilven_sku_id) + '"><span class="rvm-mapped"><i class="fa fa-check"></i> '
+                + esc(r.row.rilven_name) + '</span> <span class="rvm-muted">#' + esc(r.row.rilven_sku_id) + ' · ' + esc(r.row.rilven_measure)
+                + ' · ×' + esc(r.row.factor) + ' · screen</span> <a href="#" class="rvm-delete" title="წაშლა"><i class="fa fa-times"></i></a></div>');
             editor.remove();
         }).fail(function () { editor.find('.rvm-msg').html('<span class="rvm-warn">შენახვა ვერ მოხერხდა</span>'); btn.prop('disabled', false); });
     });
 
-    $(document).on('click', '.rvm-delete', function () {
-        var row = $(this).closest('tr'), id = row.data('id'), btn = $(this);
-        btn.prop('disabled', true);
-        post(deleteUrl, {product_id: id}).done(function (r) {
-            if (!r.ok) { btn.prop('disabled', false); return; }
-            row.find('.rvm-target').html('<span class="rvm-muted">—</span>');
-            row.find('.rvm-factor').text('');
-            row.find('.rvm-edit').text('დაკავშირება');
-            btn.remove();
-        }).fail(function () { btn.prop('disabled', false); });
+    $(document).on('click', '.rvm-delete', function (ev) {
+        ev.preventDefault();
+        var link = $(this).closest('.rvm-link'), row = $(this).closest('tr'), id = row.data('id');
+        post(deleteUrl, {product_id: id, rilven_sku_id: link.data('sku')}).done(function (r) {
+            if (!r.ok) { return; }
+            link.remove();
+            if (!row.find('.rvm-link').length) { row.find('.rvm-target').append('<span class="rvm-muted rvm-none">—</span>'); }
+        });
     });
 });
 </script>

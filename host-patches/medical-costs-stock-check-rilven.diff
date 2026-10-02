@@ -1,0 +1,22 @@
+--- a/app/controllers/admin/Medical_costs.php
++++ b/app/controllers/admin/Medical_costs.php
+@@ -278,7 +278,8 @@
+             $warehouse_id = $this->input->post('warehouse');
+ 			$warehouse = $this->site->getwarehouseByID($warehouse_id) ? $this->site->getwarehouseByID($warehouse_id)->name : NULL;
+ 			$ganyofileba = $this->site->getwarehouseByID($warehouse_id);
+-			$shemowmeba_gany = $ganyofileba->stock_check;
++			// from rilven_medic_from Rilven keeps the stock and checks it on save: this one is skipped
++			$shemowmeba_gany = $ganyofileba->stock_check && !$this->rilven_medic_model->keepsStock($date);
+             $customer_id = ($this->input->post('customer'))? $this->input->post('customer'):1;
+             $biller_id = $this->input->post('biller');
+ 
+@@ -1124,7 +1125,8 @@
+ 			$ganyofileba = $this->site->getwarehouseByID($warehouse_id);
+ 			$warehouse = $this->site->getwarehouseByID($warehouse_id) ? $this->site->getwarehouseByID($warehouse_id)->name : NULL;
+ 			//$this->sma->print_arrays($warehouse);
+-			$shemowmeba_gany = $ganyofileba->stock_check;
++			// from rilven_medic_from Rilven keeps the stock and checks it on save: this one is skipped
++			$shemowmeba_gany = $ganyofileba->stock_check && !$this->rilven_medic_model->keepsStock($date);
+             $customer_id = $this->input->post('customer');
+             $biller_id = $this->input->post('biller');
+             $total_items = $this->input->post('total_items');

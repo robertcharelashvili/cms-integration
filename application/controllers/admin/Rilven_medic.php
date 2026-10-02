@@ -7,7 +7,7 @@
  *                                                       is not here (the save answered too late and
  *                                                       was rolled back): reversed
  *   php index.php admin/rilven_medic unmapped [days]    medicines used lately with no Rilven product in
- *                                                       sma_rilven_product_map: what to map first
+ *                                                       sma_rilven_product_link: what to map first
  *   php index.php admin/rilven_medic map <id> <sku> [f] map one medicine to a Rilven product
  *
  * In the browser, admin/rilven_medic/mapping is the screen for the same map (owner and admin).
@@ -93,21 +93,20 @@ class Rilven_medic extends MY_Controller
             date('Y-m-d H:i:s'), count($ids), count($ids) - count($here), $reversed));
     }
 
-    /** Medicines used lately that have no row in sma_rilven_product_map: what to map first. */
+    /** Medicines used lately that have no link in sma_rilven_product_link: what to map first. */
     public function unmapped($days = '90')
     {
         $days = max(1, min(730, (int) $days));
         $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, MAX(i.product_unit_code) AS unit,'
                 . ' COUNT(*) AS used', FALSE)
             ->from('sale_items_medic i')->join('products p', 'p.id = i.product_id', 'left')
-            ->join('rilven_product_map m', 'm.product_id = i.product_id', 'left')
             ->where('i.post_date >=', date('Y-m-d', strtotime('-' . $days . ' days')))
-            ->where('m.product_id IS NULL', NULL, FALSE)
+            ->where('NOT EXISTS (SELECT 1 FROM ' . $this->db->dbprefix('rilven_product_link') . ' l WHERE l.product_id = i.product_id)', NULL, FALSE)
             ->group_by('i.product_id')->order_by('used', 'DESC')->get()->result();
         foreach ($rows as $r) {
             $this->say(sprintf('NOT MAPPED  id=%s  code=%s  unit=%s  used=%d  %s', $r->product_id, $r->code, $r->unit, $r->used, $r->name));
         }
-        $mapped = $this->db->count_all('rilven_product_map');
+        $mapped = (int) $this->db->query('SELECT COUNT(DISTINCT product_id) n FROM ' . $this->db->dbprefix('rilven_product_link'))->row()->n;
         $this->say(sprintf('[%s] %d medicines used in %d days have no Rilven product; %d are mapped',
             date('Y-m-d H:i:s'), count($rows), $days, $mapped));
     }
@@ -122,11 +121,7 @@ class Rilven_medic extends MY_Controller
             $this->say('usage: admin/rilven_medic map <product_id> <rilven_sku_id> [factor]');
             return;
         }
-        $sql = 'INSERT INTO ' . $this->db->dbprefix('rilven_product_map') . ' (product_id, rilven_sku_id, factor, updated_by)'
-             . ' VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE rilven_sku_id = VALUES(rilven_sku_id), factor = VALUES(factor),'
-             . ' updated_by = VALUES(updated_by)';
-        $this->db->query($sql, array((int) $productId, (int) $skuId, (float) $factor,
-            is_cli() ? NULL : (int) $this->session->userdata('user_id')));
+        $this->saveLink((int) $productId, (int) $skuId, (float) $factor);
         $this->say('mapped ' . $productId . ' -> Rilven product ' . $skuId . ' x ' . $factor);
     }
 
@@ -145,12 +140,12 @@ class Rilven_medic extends MY_Controller
             $this->db->from('sale_items_medic i')
                 ->join('products p', 'p.id = i.product_id', 'left')
                 ->join('units u', 'u.id = p.unit', 'left')
-                ->join('rilven_product_map m', 'm.product_id = i.product_id', 'left')
                 ->where('i.post_date >=', date('Y-m-d', strtotime('-' . $days . ' days')));
+            $linked = 'EXISTS (SELECT 1 FROM ' . $this->db->dbprefix('rilven_product_link') . ' l WHERE l.product_id = i.product_id)';
             if ($show === 'unmapped') {
-                $this->db->where('m.product_id IS NULL', NULL, FALSE);
+                $this->db->where('NOT ' . $linked, NULL, FALSE);
             } elseif ($show === 'mapped') {
-                $this->db->where('m.product_id IS NOT NULL', NULL, FALSE);
+                $this->db->where($linked, NULL, FALSE);
             }
             if ($q !== '') {
                 $this->db->group_start()->like('p.name', $q)->or_like('p.code', $q);
@@ -168,10 +163,33 @@ class Rilven_medic extends MY_Controller
 
         $build();
         $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, MAX(u.name) AS unit,'
-                . ' COUNT(*) AS used, MAX(i.post_date) AS last_used,'
-                . ' MAX(m.rilven_sku_id) AS rilven_sku_id, MAX(m.factor) AS factor, MAX(m.rilven_name) AS rilven_name,'
-                . ' MAX(m.rilven_code) AS rilven_code, MAX(m.rilven_measure) AS rilven_measure, MAX(m.note) AS note', FALSE)
+                . ' COUNT(*) AS used, MAX(i.post_date) AS last_used', FALSE)
             ->order_by('used', 'DESC')->limit($per, ($page - 1) * $per)->get()->result();
+
+        // every link of the page's medicines, with Rilven's names for them (one call for the page)
+        $links = array();
+        $skuIds = array();
+        if (!empty($rows)) {
+            $pids = array();
+            foreach ($rows as $r) {
+                $pids[] = (int) $r->product_id;
+            }
+            foreach ($this->db->where_in('product_id', $pids)->order_by('product_id')->get('rilven_product_link')->result() as $l) {
+                $links[(int) $l->product_id][] = $l;
+                $skuIds[(int) $l->rilven_sku_id] = TRUE;
+            }
+        }
+        $skus = array();
+        if (!empty($skuIds)) {
+            $answer = $this->rilven_client->get('/medic-consumption/products', array('ids' => implode(',', array_keys($skuIds)), 'limit' => 500));
+            if ($answer['ok']) {
+                foreach ($answer['data']['items'] as $it) {
+                    $skus[(int) $it['assetSkuId']] = $it;
+                }
+            }
+        }
+        $this->data['links'] = $links;
+        $this->data['skus'] = $skus;
 
         $this->data['rows'] = $rows;
         $this->data['total'] = $total;
@@ -180,7 +198,7 @@ class Rilven_medic extends MY_Controller
         $this->data['show'] = $show;
         $this->data['days'] = $days;
         $this->data['q'] = $q;
-        $this->data['mapped_total'] = $this->db->count_all('rilven_product_map');
+        $this->data['mapped_total'] = (int) $this->db->query('SELECT COUNT(DISTINCT product_id) n FROM ' . $this->db->dbprefix('rilven_product_link'))->row()->n;
 
         $bc = array(array('link' => base_url(), 'page' => lang('home')), array('link' => '#', 'page' => 'Rilven: მედიკამენტების დაკავშირება'));
         $meta = array('page_title' => 'Rilven: მედიკამენტების დაკავშირება', 'bc' => $bc);
@@ -226,27 +244,29 @@ class Rilven_medic extends MY_Controller
             return $this->json(array('ok' => FALSE, 'error' => 'ეს პროდუქტი Rilven-ში აღარ არსებობს'));
         }
         $sku = $items[0];
-        $sql = 'INSERT INTO ' . $this->db->dbprefix('rilven_product_map')
-             . ' (product_id, rilven_sku_id, factor, rilven_name, rilven_code, rilven_measure, note, updated_by)'
-             . ' VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE rilven_sku_id = VALUES(rilven_sku_id),'
-             . ' factor = VALUES(factor), rilven_name = VALUES(rilven_name), rilven_code = VALUES(rilven_code),'
-             . ' rilven_measure = VALUES(rilven_measure), note = VALUES(note), updated_by = VALUES(updated_by)';
-        $this->db->query($sql, array($productId, $skuId, (float) $factor,
-            isset($sku['name']) ? $sku['name'] : NULL, isset($sku['code']) ? $sku['code'] : NULL,
-            isset($sku['measure']) ? $sku['measure'] : NULL, 'screen', (int) $this->session->userdata('user_id')));
+        $this->saveLink($productId, $skuId, (float) $factor);
         return $this->json(array('ok' => TRUE, 'row' => array('rilven_sku_id' => $skuId, 'factor' => (float) $factor,
             'rilven_name' => isset($sku['name']) ? $sku['name'] : '', 'rilven_code' => isset($sku['code']) ? $sku['code'] : '',
-            'rilven_measure' => isset($sku['measure']) ? $sku['measure'] : '')));
+            'rilven_measure' => isset($sku['measure']) ? $sku['measure'] : '', 'pack_size' => isset($sku['packSize']) ? $sku['packSize'] : 1)));
     }
 
-    /** Forget one medicine's Rilven product (POST product_id). */
+    /** Forget one link of a medicine (POST product_id, rilven_sku_id). */
     public function delete_map()
     {
         if ($this->input->method() !== 'post') {
             show_404();
         }
-        $this->db->delete('rilven_product_map', array('product_id' => (int) $this->input->post('product_id')));
+        $this->db->delete('rilven_product_link', array('product_id' => (int) $this->input->post('product_id'),
+                                                       'rilven_sku_id' => (int) $this->input->post('rilven_sku_id')));
         return $this->json(array('ok' => TRUE));
+    }
+
+    /** A link a person chose: used before the learned ones; the same product again only changes its factor. */
+    private function saveLink($productId, $skuId, $factor)
+    {
+        $this->db->query('INSERT INTO ' . $this->db->dbprefix('rilven_product_link') . ' (product_id, rilven_sku_id, factor, source)'
+            . " VALUES (?, ?, ?, 'screen') ON DUPLICATE KEY UPDATE factor = VALUES(factor), source = 'screen'",
+            array((int) $productId, (int) $skuId, (float) $factor));
     }
 
     private function json($value)
@@ -323,6 +343,8 @@ class Rilven_medic extends MY_Controller
         // listed for the auditor in /root/rilven-history-opening-review.csv.
         $reference = $this->purchasePrices();
         $links = $this->links();
+        $excluded = $this->excludedProducts();
+        $skipped = 0;
         $review = array();
         $lines = array();
         $missing = 0;
@@ -330,6 +352,10 @@ class Rilven_medic extends MY_Controller
         $revalued = 0;
         $delta = 0;
         foreach ($rows as $r) {
+            if (isset($excluded[(int) $r->product_id])) {
+                $skipped++;
+                continue;
+            }
             if (empty($links[(int) $r->product_id])) {
                 $missing++;
                 continue;
@@ -360,6 +386,7 @@ class Rilven_medic extends MY_Controller
         }
         $this->say(sprintf('%d products, %.2f GEL (%d brought down to the purchase price, %+.2f; %d never bought, kept as booked); %d without a Rilven product',
             count($lines), $total, $revalued, $delta, isset($unbought) ? $unbought : 0, $missing));
+        $this->say($skipped . ' left out: never from a real supplier (own oxygen, state agency, test supplier)');
         $f = fopen('/root/rilven-history-opening-review.csv', 'w');
         fputcsv($f, array('product_id', 'note', 'opening_value', 'at_purchase_price'));
         foreach ($review as $row) {
@@ -414,6 +441,7 @@ class Rilven_medic extends MY_Controller
         );
         $links = $this->links();
         $reference = $this->purchasePrices();
+        $excluded = $this->excludedProducts();
         foreach ($groups as $key => $g) {
             $rows = $this->db->query("SELECT a.product_id, MAX(p.name) name, SUM(a.credit_count - a.debet_count) qty,
                        SUM(a.credit_amount - a.debet_amount) amt
@@ -427,7 +455,12 @@ class Rilven_medic extends MY_Controller
             $lines = array();
             $missing = array();
             $total = 0;
+            $left = 0;
             foreach ($rows as $r) {
+                if (isset($excluded[(int) $r->product_id])) {
+                    $left += $r->amt;
+                    continue;
+                }
                 $l = isset($links[(int) $r->product_id]) ? $links[(int) $r->product_id] : array();
                 if (empty($l)) {
                     $missing[] = $r->product_id;
@@ -447,7 +480,7 @@ class Rilven_medic extends MY_Controller
                                  'amount' => (int) round($amount * 10000), 'skus' => $l);
                 $total += $r->amt;
             }
-            $this->say(sprintf('%s %s: %d lines, %.2f GEL%s', $month, $key, count($lines), $total,
+            $this->say(sprintf('%s %s: %d lines, %.2f GEL (%.2f left out)%s', $month, $key, count($lines), $total, $left,
                 $missing ? '; NO Rilven product for ' . implode(',', array_slice($missing, 0, 10)) : ''));
             if ($missing || $dry === 'dry') {
                 continue;
@@ -487,6 +520,28 @@ class Rilven_medic extends MY_Controller
         $this->say($externalId . ': ' . ($answer['ok'] ? $answer['data']['status'] : 'FAILED ' . $answer['error']));
     }
 
+    /**
+     * Medicines that never came from a real supplier: the clinic's own oxygen, what the state
+     * agency gives free of charge, and the test supplier -- every purchase since 2024 from one of
+     * rilven_medic_history_exclude_suppliers. They are not material written off: their cost is
+     * elsewhere in the books or there is none. Medicines also bought for real stay in.
+     */
+    private function excludedProducts()
+    {
+        $ids = array_map('intval', (array) $this->rilven_client->cfg('rilven_medic_history_exclude_suppliers', array()));
+        if (empty($ids)) {
+            return array();
+        }
+        $in = implode(',', $ids);
+        $out = array();
+        foreach ($this->db->query('SELECT i.product_id FROM ' . $this->db->dbprefix('purchase_items') . ' i JOIN '
+                . $this->db->dbprefix('purchases') . " pu ON pu.id = i.purchase_id WHERE pu.date >= '2024-01-01'"
+                . " GROUP BY i.product_id HAVING SUM(pu.supplier_id IN ($in)) > 0 AND SUM(pu.supplier_id NOT IN ($in)) = 0")->result() as $r) {
+            $out[(int) $r->product_id] = TRUE;
+        }
+        return $out;
+    }
+
     /** product_id => the unit price it was bought at since 2024 (purchases, which are the RS invoices). */
     private function purchasePrices()
     {
@@ -503,7 +558,7 @@ class Rilven_medic extends MY_Controller
     {
         $out = array();
         foreach ($this->db->query('SELECT product_id, rilven_sku_id, factor FROM ' . $this->db->dbprefix('rilven_product_link')
-                . " ORDER BY product_id, FIELD(source, 'purchase', 'name', 'created'), purchases DESC, rilven_sku_id")->result() as $r) {
+                . " ORDER BY product_id, FIELD(source, 'screen', 'purchase', 'name', 'created'), purchases DESC, rilven_sku_id")->result() as $r) {
             $out[(int) $r->product_id][] = array('assetSkuId' => (int) $r->rilven_sku_id, 'factor' => $this->dec($r->factor));
         }
         return $out;

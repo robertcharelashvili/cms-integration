@@ -14,17 +14,19 @@
  *   3. Rilven refused, or could not be reached: roll back -- nothing is saved here either -- and
  *      send the person back to the form with the reason. Rilven posted: commit.
  *
- * Rilven is told OUR mapping's answer: its own product (asset SKU id), from sma_rilven_product_map
- * (product_id -> rilven_sku_id, factor), and the quantity actually used, in pieces (an ampoule, a
- * tablet, a ml) -- never in packs: Rilven opens its packs itself. The factor is only for a unit
- * that differs (litres here, ml there). Rilven keeps no map of this catalogue. A medicine with no
- * row there refuses the save before Rilven is even asked.
+ * Rilven is told OUR mapping's answer: every Rilven product a medicine is, from
+ * sma_rilven_product_link (one medicine bought from several suppliers is several products there),
+ * each with how many of its pieces one of our units is, and the quantity in our own unit. Rilven
+ * opens its packs itself and takes the oldest product first. Rilven keeps no map of this catalogue.
+ * A medicine with no link refuses the save before Rilven is even asked.
  *
  * The key on Rilven's side is sales_medic.id, so a second press or a retry after a lost answer
  * changes nothing. A write-off Rilven posted whose answer never arrived is left for
  * admin/rilven_medic reconcile, which reverses write-offs whose document does not exist here.
  *
  * Off (rilven_medic_enabled FALSE): every call goes straight to Medical_costs_model, unchanged.
+ * rilven_medic_from (yyyy-mm-dd): only documents dated from that day go through Rilven; earlier
+ * ones are kept here as before, and brought over month by month (admin/rilven_medic history_month).
  */
 class Rilven_medic_model extends CI_Model
 {
@@ -34,9 +36,34 @@ class Rilven_medic_model extends CI_Model
         $this->load->admin_model('medical_costs_model');
     }
 
-    private function enabled()
+    /** Whether a document of this date goes through Rilven. Settings are read through the client: rilven.php is a section. */
+    private function covers($date)
     {
-        return (bool) $this->config->item('rilven_medic_enabled');
+        if (!$this->client()->cfg('rilven_medic_enabled', FALSE)) {
+            return FALSE;
+        }
+        $from = trim((string) $this->client()->cfg('rilven_medic_from', ''));
+        if ($from === '') {
+            return TRUE;
+        }
+        $day = ($date === NULL || $date === '') ? date('Y-m-d') : date('Y-m-d', strtotime((string) $date));
+        return $day >= $from;
+    }
+
+    /**
+     * Whether Rilven keeps the stock for a document of this date: then it checks the department's
+     * shelf on save, and this CMS's own check (Medical_costs, stock_check) is skipped -- it would
+     * read a stock nobody keeps here any more.
+     */
+    public function keepsStock($date)
+    {
+        return $this->covers($date);
+    }
+
+    private function documentDate($id)
+    {
+        $row = $this->db->select('date')->get_where('sales_medic', array('id' => $id), 1)->row();
+        return $row ? $row->date : NULL;
     }
 
     /** The sync's own HTTP client and its warehouse lookup, loaded once. */
@@ -56,7 +83,7 @@ class Rilven_medic_model extends CI_Model
     public function addSale($data = array(), $items = array(), $page_number = null, $colomn = null,
                             $add_template = null, $template_name = null)
     {
-        if (!$this->enabled()) {
+        if (!$this->covers(isset($data['date']) ? $data['date'] : NULL)) {
             return $this->medical_costs_model->addSale($data, $items, $page_number, $colomn, $add_template, $template_name);
         }
         $this->db->trans_begin();
@@ -70,7 +97,9 @@ class Rilven_medic_model extends CI_Model
 
     public function updateSale($id, $data, $items = array())
     {
-        if (!$this->enabled()) {
+        // through Rilven if either the date it had or the date it gets is covered: a document moved
+        // across the first day must still have its write-off reversed or posted
+        if (!$this->covers($this->documentDate($id)) && !$this->covers(isset($data['date']) ? $data['date'] : NULL)) {
             return $this->medical_costs_model->updateSale($id, $data, $items);
         }
         $this->db->trans_begin();
@@ -83,7 +112,7 @@ class Rilven_medic_model extends CI_Model
 
     public function deleteSale($id)
     {
-        if (!$this->enabled()) {
+        if (!$this->covers($this->documentDate($id))) {
             return $this->medical_costs_model->deleteSale($id);
         }
         $this->db->trans_begin();
@@ -135,7 +164,7 @@ class Rilven_medic_model extends CI_Model
             'externalId'  => (string) $id,
             'warehouseId' => (int) $warehouse['id'],
             'date'        => $header->date ? date('Y-m-d H:i:s', strtotime($header->date)) : NULL,
-            'comment'     => 'CMS medic ' . $id . ($header->parent_id ? ' / case ' . $header->parent_id : ''),
+            'comment'     => 'CMS medic ' . $id . $this->caseLabel($header),
             'lines'       => array(),
         );
 
@@ -154,41 +183,44 @@ class Rilven_medic_model extends CI_Model
         // who answers for it: the performer of the service line, else the configured default
         $taxCode = $this->performerTaxCode((int) $header->sale_items_id);
         if ($taxCode === '') {
-            $taxCode = trim((string) $this->config->item('rilven_medic_default_employee_tax_code'));
+            $taxCode = trim((string) $this->client()->cfg('rilven_medic_default_employee_tax_code', ''));
         }
         if ($taxCode !== '') {
             $payload['employeeTaxCode'] = $taxCode;
         }
 
-        // our map: each medicine as Rilven's product, in Rilven's unit
-        $map = array();
+        // our links: every Rilven product each medicine is, with its factor; purchase-learned first
+        $links = array();
         $productIds = array();
         foreach ($lines as $l) {
             $productIds[(int) $l->product_id] = TRUE;
         }
         if (!empty($productIds)) {
-            foreach ($this->db->select('product_id, rilven_sku_id, factor')->from('rilven_product_map')
-                         ->where_in('product_id', array_keys($productIds))->get()->result() as $m) {
-                $map[(int) $m->product_id] = $m;
+            foreach ($this->db->select('product_id, rilven_sku_id, factor')->from('rilven_product_link')
+                         ->where_in('product_id', array_keys($productIds))
+                         ->order_by("FIELD(source, 'screen', 'purchase', 'name', 'created')", '', FALSE)
+                         ->order_by('purchases', 'DESC')->get()->result() as $m) {
+                $links[(int) $m->product_id][] = array('assetSkuId' => (int) $m->rilven_sku_id,
+                    'factor' => rtrim(rtrim(number_format((float) $m->factor, 6, '.', ''), '0'), '.'));
             }
         }
+        $untracked = $this->untracked(array_keys($productIds));
         $unmapped = array();
         foreach ($lines as $l) {
             // unit_quantity is the base unit the stock moves in (updateAVCO moves it), not the pack
             $quantity = $l->unit_quantity !== NULL ? $l->unit_quantity : $l->quantity;
-            if ((float) $quantity == 0) {
+            if ((float) $quantity == 0 || isset($untracked[(int) $l->product_id])) {
                 continue;
             }
-            if (!isset($map[(int) $l->product_id])) {
+            if (empty($links[(int) $l->product_id])) {
                 $unmapped[] = $l->product_name;
                 continue;
             }
-            $m = $map[(int) $l->product_id];
             $payload['lines'][] = array(
-                'assetSkuId'  => (int) $m->rilven_sku_id,
+                'skus'        => $links[(int) $l->product_id],
                 'productName' => (string) $l->product_name,
-                // pieces, up to 4 decimals
-                'quantity'    => rtrim(rtrim(number_format((float) $quantity * (float) $m->factor, 4, '.', ''), '0'), '.'),
+                // in our own unit, up to 4 decimals; the factors turn it into pieces
+                'quantity'    => rtrim(rtrim(number_format((float) $quantity, 4, '.', ''), '0'), '.'),
             );
         }
         if (!empty($unmapped)) {
@@ -200,6 +232,40 @@ class Rilven_medic_model extends CI_Model
             return array('ok' => TRUE, 'error' => '', 'data' => array('status' => 'empty'));
         }
         return $this->client()->put('/medic-consumption/post', $payload);
+    }
+
+    /**
+     * Medicines Rilven keeps no stock of: every purchase since 2024 came from one of
+     * rilven_medic_history_exclude_suppliers (the clinic's own oxygen, the state agency's free
+     * supplies, the test supplier). They are not material written off -- left out of the history
+     * the same way -- so a document's line of them is not sent.
+     */
+    private function untracked($productIds)
+    {
+        $ids = array_map('intval', (array) $this->client()->cfg('rilven_medic_history_exclude_suppliers', array()));
+        if (empty($ids) || empty($productIds)) {
+            return array();
+        }
+        $in = implode(',', $ids);
+        $out = array();
+        foreach ($this->db->query('SELECT i.product_id FROM ' . $this->db->dbprefix('purchase_items') . ' i JOIN '
+                . $this->db->dbprefix('purchases') . " pu ON pu.id = i.purchase_id WHERE pu.date >= '2024-01-01'"
+                . ' AND i.product_id IN (' . implode(',', array_map('intval', $productIds)) . ')'
+                . " GROUP BY i.product_id HAVING SUM(pu.supplier_id IN ($in)) > 0 AND SUM(pu.supplier_id NOT IN ($in)) = 0")->result() as $r) {
+            $out[(int) $r->product_id] = TRUE;
+        }
+        return $out;
+    }
+
+    /** " / case <number>": the clinic's case number, which is the Rilven case document's number too. */
+    private function caseLabel($header)
+    {
+        if ((int) $header->parent_id <= 0) {
+            return '';
+        }
+        $case = $this->db->select('reference_no')->get_where('sales', array('id' => (int) $header->parent_id), 1)->row();
+        $reference = $case ? trim((string) $case->reference_no) : '';
+        return ' / case ' . ($reference !== '' ? $reference : '#' . $header->parent_id);
     }
 
     private function performerTaxCode($saleItemId)
@@ -233,8 +299,8 @@ class Rilven_medic_model extends CI_Model
         if (strpos($error, 'medic-product-not-found') === 0) {
             return 'ჩამოწერა შეჩერდა: დაკავშირებული პროდუქტი Rilven-ში აღარ არსებობს — ' . $meta;
         }
-        if (strpos($error, 'medic-quantity-not-whole') === 0) {
-            return 'ჩამოწერა შეჩერდა: რაოდენობა ერთეულში მთელი არ გამოდის — ' . $meta;
+        if (strpos($error, 'medic-product-not-stock') === 0) {
+            return 'ჩამოწერა შეჩერდა: დაკავშირებული პროდუქტი Rilven-ში სასაქონლო მარაგი არ არის (ძირითადი საშუალებაა) — ' . $meta;
         }
         if (strpos($error, 'medic-warehouse-not-synced') === 0) {
             return 'ჩამოწერა შეჩერდა: განყოფილების საწყობი Rilven-ში არ არის';
