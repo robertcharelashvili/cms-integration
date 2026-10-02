@@ -6,10 +6,9 @@
  *   php index.php admin/rilven_medic reconcile [days]   write-offs Rilven posted for a document that
  *                                                       is not here (the save answered too late and
  *                                                       was rolled back): reversed
- *   php index.php admin/rilven_medic products [days]    the medicines used lately that Rilven cannot
- *                                                       match to its catalogue: what to map first
- *   php index.php admin/rilven_medic push_products [days]  the medicines used lately, with how often,
- *                                                       sent to Rilven's mapping screen
+ *   php index.php admin/rilven_medic unmapped [days]    medicines used lately with no Rilven product in
+ *                                                       sma_rilven_product_map: what to map first
+ *   php index.php admin/rilven_medic map <id> <sku> [f] map one medicine to a Rilven product
  *   php index.php admin/rilven_medic status
  *
  * The same pages open in a browser for the Owner.
@@ -89,64 +88,37 @@ class Rilven_medic extends MY_Controller
             date('Y-m-d H:i:s'), count($ids), count($ids) - count($here), $reversed));
     }
 
-    public function push_products($days = '90')
+    /** Medicines used lately that have no row in sma_rilven_product_map: what to map first. */
+    public function unmapped($days = '90')
     {
         $days = max(1, min(730, (int) $days));
         $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, MAX(i.product_unit_code) AS unit,'
-                . ' COUNT(*) AS used, MAX(DATE(i.post_date)) AS last_used', FALSE)
+                . ' COUNT(*) AS used', FALSE)
             ->from('sale_items_medic i')->join('products p', 'p.id = i.product_id', 'left')
+            ->join('rilven_product_map m', 'm.product_id = i.product_id', 'left')
             ->where('i.post_date >=', date('Y-m-d', strtotime('-' . $days . ' days')))
-            ->group_by('i.product_id')->get()->result();
-        $sent = 0;
-        foreach (array_chunk($rows, 1000) as $chunk) {
-            $products = array();
-            foreach ($chunk as $r) {
-                $products[] = array('productId' => (string) $r->product_id, 'code' => mb_substr((string) $r->code, 0, 64),
-                    'name' => mb_substr((string) $r->name, 0, 255), 'unit' => mb_substr((string) $r->unit, 0, 64),
-                    'usedCount' => (int) $r->used, 'lastUsed' => (string) $r->last_used);
-            }
-            $answer = $this->rilven_client->put('/medic-consumption/products', array('products' => $products));
-            if (!$answer['ok']) {
-                $this->say('STOPPED: ' . $answer['error']);
-                return;
-            }
-            $sent += count($products);
+            ->where('m.product_id IS NULL', NULL, FALSE)
+            ->group_by('i.product_id')->order_by('used', 'DESC')->get()->result();
+        foreach ($rows as $r) {
+            $this->say(sprintf('NOT MAPPED  id=%s  code=%s  unit=%s  used=%d  %s', $r->product_id, $r->code, $r->unit, $r->used, $r->name));
         }
-        $this->say(sprintf('[%s] rilven medic: %d products used in %d days sent to the mapping screen',
-            date('Y-m-d H:i:s'), $sent, $days));
+        $mapped = $this->db->count_all('rilven_product_map');
+        $this->say(sprintf('[%s] %d medicines used in %d days have no Rilven product; %d are mapped',
+            date('Y-m-d H:i:s'), count($rows), $days, $mapped));
     }
 
-    public function products($days = '90')
+    /** Map one medicine: php index.php admin/rilven_medic map <product_id> <rilven_sku_id> [factor] */
+    public function map($productId = '', $skuId = '', $factor = '1')
     {
-        $days = max(1, min(730, (int) $days));
-        $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, COUNT(*) AS used', FALSE)
-            ->from('sale_items_medic i')->join('products p', 'p.id = i.product_id', 'left')
-            ->where('i.post_date >=', date('Y-m-d', strtotime('-' . $days . ' days')))
-            ->group_by('i.product_id')->order_by('used', 'DESC')->get()->result();
-        $unmatched = 0;
-        $byVia = array('map' => 0, 'code' => 0);
-        foreach (array_chunk($rows, 500) as $chunk) {
-            $products = array();
-            foreach ($chunk as $r) {
-                $products[] = array('productId' => (string) $r->product_id, 'productCode' => (string) $r->code,
-                                    'productName' => (string) $r->name);
-            }
-            $answer = $this->rilven_client->post('/medic-consumption/check-products', array('products' => $products));
-            if (!$answer['ok']) {
-                $this->say('STOPPED: ' . $answer['error']);
-                return;
-            }
-            foreach ($answer['data']['items'] as $k => $m) {
-                if ($m['matched']) {
-                    $byVia[$m['via']] = isset($byVia[$m['via']]) ? $byVia[$m['via']] + 1 : 1;
-                    continue;
-                }
-                $unmatched++;
-                $this->say(sprintf('NOT MATCHED  id=%s  code=%s  used=%d  %s', $m['productId'], $m['productCode'],
-                    $chunk[$k]->used, $m['productName']));
-            }
+        if (!ctype_digit((string) $productId) || !ctype_digit((string) $skuId) || !is_numeric($factor) || (float) $factor <= 0) {
+            $this->say('usage: admin/rilven_medic map <product_id> <rilven_sku_id> [factor]');
+            return;
         }
-        $this->say(sprintf('[%s] %d products used in %d days: %d matched by map, %d by barcode, %d not matched',
-            date('Y-m-d H:i:s'), count($rows), $days, $byVia['map'], $byVia['code'], $unmatched));
+        $sql = 'INSERT INTO ' . $this->db->dbprefix('rilven_product_map') . ' (product_id, rilven_sku_id, factor, updated_by)'
+             . ' VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE rilven_sku_id = VALUES(rilven_sku_id), factor = VALUES(factor),'
+             . ' updated_by = VALUES(updated_by)';
+        $this->db->query($sql, array((int) $productId, (int) $skuId, (float) $factor,
+            is_cli() ? NULL : (int) $this->session->userdata('user_id')));
+        $this->say('mapped ' . $productId . ' -> Rilven product ' . $skuId . ' x ' . $factor);
     }
 }

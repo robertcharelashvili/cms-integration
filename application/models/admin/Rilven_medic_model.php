@@ -14,6 +14,10 @@
  *   3. Rilven refused, or could not be reached: roll back -- nothing is saved here either -- and
  *      send the person back to the form with the reason. Rilven posted: commit.
  *
+ * Rilven is told OUR mapping's answer: its own product (asset SKU id) and quantity in its own unit,
+ * from sma_rilven_product_map (product_id -> rilven_sku_id, factor). Rilven keeps no map of this
+ * catalogue. A medicine with no row there refuses the save before Rilven is even asked.
+ *
  * The key on Rilven's side is sales_medic.id, so a second press or a retry after a lost answer
  * changes nothing. A write-off Rilven posted whose answer never arrived is left for
  * admin/rilven_medic reconcile, which reverses write-offs whose document does not exist here.
@@ -154,18 +158,40 @@ class Rilven_medic_model extends CI_Model
             $payload['employeeTaxCode'] = $taxCode;
         }
 
+        // our map: each medicine as Rilven's product, in Rilven's unit
+        $map = array();
+        $productIds = array();
+        foreach ($lines as $l) {
+            $productIds[(int) $l->product_id] = TRUE;
+        }
+        if (!empty($productIds)) {
+            foreach ($this->db->select('product_id, rilven_sku_id, factor')->from('rilven_product_map')
+                         ->where_in('product_id', array_keys($productIds))->get()->result() as $m) {
+                $map[(int) $m->product_id] = $m;
+            }
+        }
+        $unmapped = array();
         foreach ($lines as $l) {
             // unit_quantity is the base unit the stock moves in (updateAVCO moves it), not the pack
             $quantity = $l->unit_quantity !== NULL ? $l->unit_quantity : $l->quantity;
             if ((float) $quantity == 0) {
                 continue;
             }
+            if (!isset($map[(int) $l->product_id])) {
+                $unmapped[] = $l->product_name;
+                continue;
+            }
+            $m = $map[(int) $l->product_id];
             $payload['lines'][] = array(
-                'productId'   => (string) $l->product_id,
-                'productCode' => (string) $l->product_code,
+                'assetSkuId'  => (int) $m->rilven_sku_id,
                 'productName' => (string) $l->product_name,
-                'quantity'    => (string) $quantity,
+                // in Rilven's unit; Rilven refuses what does not come to a whole number
+                'quantity'    => rtrim(rtrim(number_format((float) $quantity * (float) $m->factor, 4, '.', ''), '0'), '.'),
             );
+        }
+        if (!empty($unmapped)) {
+            return array('ok' => FALSE, 'error' => 'medic-product-not-mapped', 'retryable' => FALSE,
+                         'data' => array('meta' => array('products' => implode('; ', $unmapped))));
         }
         if (empty($payload['lines'])) {
             // nothing to write off: an empty document is not a refusal, and not a call
@@ -200,7 +226,10 @@ class Rilven_medic_model extends CI_Model
             return 'ჩამოწერა შეჩერდა: ნაშთი არ არის საკმარისი (არის / საჭიროა) — ' . $meta;
         }
         if (strpos($error, 'medic-product-not-mapped') === 0) {
-            return 'ჩამოწერა შეჩერდა: მედიკამენტი Rilven-ში დაკავშირებული არ არის — ' . $meta;
+            return 'ჩამოწერა შეჩერდა: მედიკამენტი Rilven-ის პროდუქტთან დაკავშირებული არ არის — ' . $meta;
+        }
+        if (strpos($error, 'medic-product-not-found') === 0) {
+            return 'ჩამოწერა შეჩერდა: დაკავშირებული პროდუქტი Rilven-ში აღარ არსებობს — ' . $meta;
         }
         if (strpos($error, 'medic-quantity-not-whole') === 0) {
             return 'ჩამოწერა შეჩერდა: რაოდენობა ერთეულში მთელი არ გამოდის — ' . $meta;
