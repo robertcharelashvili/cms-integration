@@ -136,16 +136,18 @@ class Rilven_sync extends MY_Controller
      * Load who performed each line onto cases already in Rilven, from a date. Resumable; "restart"
      * starts over from the date.
      *
-     *     php index.php admin/rilven_sync performers 2025-01-01
+     *     php index.php admin/rilven_sync performers 2025-01-01          (all, resuming)
+     *     php index.php admin/rilven_sync performers 2025-01-01 50       (a trial of 50 cases)
+     *     php index.php admin/rilven_sync performers 2025-01-01 0 restart
      */
-    public function performers($from = '', $restart = '')
+    public function performers($from = '', $limit = '0', $restart = '')
     {
         if (!is_cli()) { show_404(); }
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) {
-            $this->say('usage: admin/rilven_sync performers YYYY-MM-DD [restart]');
+            $this->say('usage: admin/rilven_sync performers YYYY-MM-DD [limit] [restart]');
             return;
         }
-        $limit = (int) $this->input->get('limit');
+        $limit = (int) $limit;
         $m = $this->rilven->backfillPerformers($from, $limit, $restart === 'restart');
         $this->say(sprintf('[%s] rilven: performers from %s cases=%d lines=%d missing=%d refused=%d calls=%d last=%d %s',
             date('Y-m-d H:i:s'), $from, $m['cases'], $m['lines'], $m['missing'], $m['refused'], $m['calls'], $m['last'],
