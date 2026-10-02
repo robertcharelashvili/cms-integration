@@ -169,7 +169,6 @@ class Rilven_medic extends MY_Controller
         $build();
         $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, MAX(u.name) AS unit,'
                 . ' COUNT(*) AS used, MAX(i.post_date) AS last_used,'
-                . ' SUM(i.unit_quantity <> FLOOR(i.unit_quantity)) AS fractional,'
                 . ' MAX(m.rilven_sku_id) AS rilven_sku_id, MAX(m.factor) AS factor, MAX(m.rilven_name) AS rilven_name,'
                 . ' MAX(m.rilven_code) AS rilven_code, MAX(m.rilven_measure) AS rilven_measure, MAX(m.note) AS note', FALSE)
             ->order_by('used', 'DESC')->limit($per, ($page - 1) * $per)->get()->result();

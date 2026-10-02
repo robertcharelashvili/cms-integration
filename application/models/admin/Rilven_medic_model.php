@@ -14,9 +14,11 @@
  *   3. Rilven refused, or could not be reached: roll back -- nothing is saved here either -- and
  *      send the person back to the form with the reason. Rilven posted: commit.
  *
- * Rilven is told OUR mapping's answer: its own product (asset SKU id) and quantity in its own unit,
- * from sma_rilven_product_map (product_id -> rilven_sku_id, factor). Rilven keeps no map of this
- * catalogue. A medicine with no row there refuses the save before Rilven is even asked.
+ * Rilven is told OUR mapping's answer: its own product (asset SKU id), from sma_rilven_product_map
+ * (product_id -> rilven_sku_id, factor), and the quantity actually used, in pieces (an ampoule, a
+ * tablet, a ml) -- never in packs: Rilven opens its packs itself. The factor is only for a unit
+ * that differs (litres here, ml there). Rilven keeps no map of this catalogue. A medicine with no
+ * row there refuses the save before Rilven is even asked.
  *
  * The key on Rilven's side is sales_medic.id, so a second press or a retry after a lost answer
  * changes nothing. A write-off Rilven posted whose answer never arrived is left for
@@ -185,7 +187,7 @@ class Rilven_medic_model extends CI_Model
             $payload['lines'][] = array(
                 'assetSkuId'  => (int) $m->rilven_sku_id,
                 'productName' => (string) $l->product_name,
-                // in Rilven's unit; Rilven refuses what does not come to a whole number
+                // pieces, up to 4 decimals
                 'quantity'    => rtrim(rtrim(number_format((float) $quantity * (float) $m->factor, 4, '.', ''), '0'), '.'),
             );
         }

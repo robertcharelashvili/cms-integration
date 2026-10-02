@@ -25,8 +25,10 @@ $link = function ($changes) use ($show, $days, $q, $page) {
     </div>
     <div class="box-content">
         <p class="introtext">
-            მედიკამენტის ჩამოწერისას Rilven-ს ეგზავნება აქ მითითებული Rilven-ის პროდუქტი და რაოდენობა × კოეფიციენტი
-            (რამდენი Rilven-ის ერთეულია ჩვენი ერთი ერთეული). დაუკავშირებელი მედიკამენტით შენახვა შეჩერდება.
+            მედიკამენტის ჩამოწერისას Rilven-ს ეგზავნება აქ მითითებული Rilven-ის პროდუქტი და გამოყენებული რაოდენობა ცალობით
+            (ამპულა, ტაბლეტი, მლ). შეფუთვას Rilven თავად ხსნის: N10 შეფუთვიდან ერთი ამპულა ჩამოიწერება როგორც 1 ცალი.
+            კოეფიციენტი საჭიროა მხოლოდ მაშინ, როცა ერთეული განსხვავდება (მაგ. CMS-ში ლიტრი, Rilven-ში მლ → 1000).
+            დაუკავშირებელი მედიკამენტით შენახვა შეჩერდება.
             სულ დაკავშირებულია: <b><?= (int) $mapped_total ?></b>.
         </p>
 
@@ -64,9 +66,6 @@ $link = function ($changes) use ($show, $days, $q, $page) {
                         data-name="<?= $e($r->name) ?>" data-unit="<?= $e($r->unit) ?>">
                         <td><?= (int) $r->product_id ?></td>
                         <td><?= $e($r->name) ?><br><span class="rvm-muted"><?= $e($r->code) ?></span>
-                            <?php if ((int) $r->fractional > 0): ?>
-                                <br><span class="rvm-warn" title="Rilven-ში რაოდენობა მთელი უნდა იყოს">წილადი რაოდენობა <?= (int) $r->fractional ?>-ჯერ — საჭიროა კოეფიციენტი</span>
-                            <?php endif; ?>
                         </td>
                         <td><?= $e($r->unit) ?></td>
                         <td><?= (int) $r->used ?><br><span class="rvm-muted"><?= $e(substr((string) $r->last_used, 0, 10)) ?></span></td>
@@ -140,8 +139,8 @@ $(function () {
             '<button type="button" class="btn btn-success rvm-save" disabled>შენახვა</button> ' +
             '<button type="button" class="btn btn-link rvm-cancel">გაუქმება</button>' +
             '<span class="rvm-msg" style="margin-left:10px"></span></div>' +
-            '<div class="rvm-muted" style="margin-top:6px">კოეფიციენტი = რამდენი Rilven-ის ერთეულია CMS-ის ერთ ერთეულში (ჩვენი ერთეული: ' + esc(row.data('unit')) + '). ' +
-            'შედეგი უნდა იყოს მთელი რიცხვი.</div>' +
+            '<div class="rvm-muted" style="margin-top:6px">კოეფიციენტი ჩვეულებრივ 1-ია: შეფუთვას Rilven თავად ხსნის. ' +
+            'შეცვალეთ მხოლოდ განსხვავებული ერთეულისთვის (ჩვენი ერთეული: ' + esc(row.data('unit')) + ').</div>' +
             '<div class="rvm-results"></div></td></tr>');
         editor.data('for', id);
         row.after(editor);
@@ -159,12 +158,12 @@ $(function () {
             if (!r.ok) { box.html('<span class="rvm-warn">' + esc(r.error) + '</span>'); return; }
             if (!r.items.length) { box.html('<span class="rvm-muted">Rilven-ში ვერ მოიძებნა — სცადეთ სხვა სიტყვა</span>'); return; }
             var unit = String($('#rvm-row-' + editor.data('for')).data('unit') || '');
-            var html = '<table class="table table-condensed table-bordered"><thead><tr><th>#</th><th>დასახელება</th><th>კოდი</th><th>ერთეული</th><th>ნაშთი</th></tr></thead><tbody>';
+            var html = '<table class="table table-condensed table-bordered"><thead><tr><th>#</th><th>დასახელება</th><th>კოდი</th><th>ერთეული</th><th>შეფუთვაში</th><th>ნაშთი (ცალი)</th></tr></thead><tbody>';
             r.items.forEach(function (s) {
                 var differs = s.measure && unit && s.measure !== unit;
                 html += '<tr data-sku="' + esc(s.assetSkuId) + '"><td>' + esc(s.assetSkuId) + '</td><td>' + esc(s.name) + '</td><td>' + esc(s.code) +
                     '</td><td' + (differs ? ' class="rvm-warn" title="ერთეული განსხვავდება — შეამოწმეთ კოეფიციენტი"' : '') + '>' + esc(s.measure) +
-                    '</td><td>' + esc(s.onHand) + '</td></tr>';
+                    '</td><td>' + esc(s.packSize) + '</td><td>' + esc(s.unitsOnHand) + '</td></tr>';
             });
             box.html(html + '</tbody></table>');
         }).fail(function () { box.html('<span class="rvm-warn">მოთხოვნა ვერ შესრულდა</span>'); });
