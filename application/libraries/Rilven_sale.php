@@ -390,11 +390,35 @@ class Rilven_sale
             $waybill['comment'] = $this->clip($comment, 255);
         }
 
+        // What kind of episode: Rilven's service type with the CMS's own code. Unknown codes, and
+        // a Rilven that has no such type yet, send nothing rather than refuse the case.
+        $typeCode = $this->serviceTypeCode($row);
+        if ($typeCode !== '' && isset($refs['serviceTypes'][$typeCode])) {
+            $waybill['serviceTypeId'] = $refs['serviceTypes'][$typeCode];
+        }
+
         $out['sourceWarehouseId'] = $this->sourceWarehouse($row);
         $out['post'] = $this->shouldPost($row);
 
         $out['waybill'] = $waybill;
         return $out;
+    }
+
+    /**
+     * The case's kind as a code: sma_sales.service (1 planned ambulatory, 3 day stationary,
+     * 4 stationary), except that the clinic marks an EMERGENCY ambulatory case as service 4 with
+     * gad_amb = 1 -- that one is code 2, the CMS's own label for it.
+     */
+    public function serviceTypeCode($row)
+    {
+        $service = isset($row->service) ? (int) $row->service : 0;
+        if ($service <= 0) {
+            return '';
+        }
+        if ($service === 4 && isset($row->gad_amb) && (int) $row->gad_amb === 1) {
+            return '2';
+        }
+        return (string) $service;
     }
 
     /** The CMS warehouse the case was treated in. */
@@ -851,7 +875,13 @@ class Rilven_sale
         // `post` is in here on purpose. An inpatient case that a person has just marked
         // `completed` is otherwise byte-for-byte what was sent before, so the run would read it
         // as unchanged and the accrual would never be written.
-        return hash('sha256', json_encode(array($mapped['waybill'], $mapped['lines'],
+        //
+        // serviceTypeId is left out: it arrived after 135 000 cases had been sent, and a hash that
+        // moved with it would have every one of them sent again. A case that changes for any other
+        // reason carries its type along; the history was filled in on Rilven's side directly.
+        $waybill = $mapped['waybill'];
+        unset($waybill['serviceTypeId']);
+        return hash('sha256', json_encode(array($waybill, $mapped['lines'],
                                                 $mapped['post'])));
     }
 
@@ -1353,6 +1383,20 @@ class Rilven_sale
             // The service register's answer, because a service sold cannot be taxed differently
             // from the service in the reference.
             $refs['vatType'] = $this->intOrNull($this->client->cfg('rilven_service_vat_type', NULL));
+        }
+
+        // Rilven's service types by code, once per run. Not having them is not a reason to stop:
+        // the case goes without a type.
+        $refs['serviceTypes'] = array();
+        $answer = $this->client->get('/service-type/list-all');
+        if ($answer['ok'] && isset($answer['data']['items']) && is_array($answer['data']['items'])) {
+            foreach ($answer['data']['items'] as $t) {
+                if (isset($t['code'], $t['id']) && $t['code'] !== '') {
+                    $refs['serviceTypes'][(string) $t['code']] = (int) $t['id'];
+                }
+            }
+        } else {
+            $refs['notes'][] = 'service types unavailable: ' . $answer['error'];
         }
 
         $this->refs = $refs;
