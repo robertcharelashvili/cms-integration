@@ -944,6 +944,13 @@ class Rilven_sale
                 $performers = array();
                 foreach ($line['performers'] as $p) {
                     $one = array('employeeTaxCode' => $p['taxCode'], 'employeeName' => $p['name']);
+                    // the CMS owns the staff list: a doctor Rilven does not know yet is created
+                    // there from sma_companies (by personal number only, never by name)
+                    if ($this->client->cfg('rilven_performer_create_missing', TRUE)) {
+                        $one['createIfMissing'] = TRUE;
+                        if ($p['phone'] !== '') { $one['employeePhone'] = $this->clip($p['phone'], 50); }
+                        if ($p['email'] !== '') { $one['employeeEmail'] = $this->clip($p['email'], 255); }
+                    }
                     if ($p['share'] !== NULL) {
                         $one['sharePercent'] = (int) $p['share'];
                     }

@@ -673,6 +673,9 @@ $config['rilven_performer_team_table']      = 'salary_action';
 $config['rilven_performer_amount_column']   = '';
 // salary_action column with the member's role; '' = no role
 $config['rilven_performer_role_column']     = '';
+// a performer Rilven does not know is created there from sma_companies (name, vat_no, phone, email);
+// one with no personal number still refuses the case
+$config['rilven_performer_create_missing']  = TRUE;
 
 // Which column dates a case, for the window above.
 $config['rilven_sale_date_column'] = 'date';

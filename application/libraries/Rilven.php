@@ -2135,7 +2135,7 @@ class Rilven
         }
         $staff = array();
         if (!empty($staffIds)) {
-            foreach ($this->CI->db->select('id, TRIM(vat_no) AS tax_code, name', FALSE)->from($staffTable)
+            foreach ($this->CI->db->select('id, TRIM(vat_no) AS tax_code, name, phone, email', FALSE)->from($staffTable)
                          ->where_in('id', array_keys($staffIds))->get()->result() as $c) {
                 $staff[(int) $c->id] = $c;
             }
@@ -2200,6 +2200,8 @@ class Rilven
         return array(
             'taxCode' => $c ? (string) $c->tax_code : '',
             'name'    => $c ? (string) $c->name : '',
+            'phone'   => $c && isset($c->phone) ? (string) $c->phone : '',
+            'email'   => $c && isset($c->email) ? (string) $c->email : '',
             'share'   => $share,
             'role'    => $role,
         );
