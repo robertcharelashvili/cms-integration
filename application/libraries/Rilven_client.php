@@ -111,6 +111,12 @@ class Rilven_client
     // configuration
     // -----------------------------------------------------------------------
 
+    /** One setting changed for this request only, e.g. a longer timeout for a long CLI run. */
+    public function override($key, $value)
+    {
+        $this->cfg[$key] = $value;
+    }
+
     public function cfg($key, $default = NULL)
     {
         if (isset($this->cfg[$key])) {

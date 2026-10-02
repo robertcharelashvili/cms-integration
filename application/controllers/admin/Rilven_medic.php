@@ -48,7 +48,7 @@ class Rilven_medic extends MY_Controller
 
     public function status()
     {
-        $this->say('rilven_medic_enabled: ' . ($this->config->item('rilven_medic_enabled') ? 'ON' : 'off'));
+        $this->say('rilven_medic_enabled: ' . ($this->rilven_client->cfg('rilven_medic_enabled', FALSE) ? 'ON' : 'off'));
         $today = date('Y-m-d');
         $answer = $this->rilven_client->get('/medic-consumption/list',
             array('date-from' => date('Y-m-d', strtotime('-7 days')), 'date-to' => $today));
@@ -268,7 +268,7 @@ class Rilven_medic extends MY_Controller
     public function history_products()
     {
         $this->cliOnly();
-        $this->config->set_item('rilven_timeout', 900);
+        $this->rilven_client->override('rilven_timeout', 900);
         $prefix = $this->db->dbprefix;
         $rows = $this->db->query("SELECT p.id, p.name FROM {$prefix}products p
               WHERE p.id IN (SELECT a.product_id FROM {$prefix}store_action a
@@ -286,10 +286,10 @@ class Rilven_medic extends MY_Controller
                 $items[] = array('code' => 'cms-' . $r->id, 'name' => $this->cleanName($r->name, $r->id));
             }
             $answer = $this->rilven_client->post('/medic-consumption/history/products', array(
-                'accountPlanMapId' => (int) $this->config->item('rilven_medic_history_account_plan_map_id'),
-                'categoryId'       => (int) $this->config->item('rilven_medic_history_category_id'),
-                'measureId'        => (int) $this->config->item('rilven_medic_history_measure_id'),
-                'vatType'          => (int) $this->config->item('rilven_medic_history_vat_type'),
+                'accountPlanMapId' => (int) $this->rilven_client->cfg('rilven_medic_history_account_plan_map_id'),
+                'categoryId'       => (int) $this->rilven_client->cfg('rilven_medic_history_category_id'),
+                'measureId'        => (int) $this->rilven_client->cfg('rilven_medic_history_measure_id'),
+                'vatType'          => (int) $this->rilven_client->cfg('rilven_medic_history_vat_type'),
                 'items'            => $items,
             ));
             if (!$answer['ok']) {
@@ -310,26 +310,62 @@ class Rilven_medic extends MY_Controller
     public function history_opening($dry = '')
     {
         $this->cliOnly();
-        $this->config->set_item('rilven_timeout', 1800);
+        $this->rilven_client->override('rilven_timeout', 1800);
         $prefix = $this->db->dbprefix;
         $rows = $this->db->query("SELECT a.product_id, SUM(a.debet_count - a.credit_count) qty, SUM(a.debet_amount - a.credit_amount) amt
               FROM {$prefix}store_action a WHERE a.posted_date < '2025-01-01'
              GROUP BY a.product_id HAVING qty > 0 AND amt > 0")->result();
+        // an opening valued at more than 3x what the unit was BOUGHT for is a valuation error in
+        // our books (a plaster counted in cm and valued per roll) and comes down to the purchase
+        // price; the difference stays on 1620. Only down: a stock worth less than its purchase
+        // price is more often a unit kept in ml and bought by the bottle, and raising it would make
+        // value out of nothing. Those, and the medicines never bought, keep their value and are
+        // listed for the auditor in /root/rilven-history-opening-review.csv.
+        $reference = $this->purchasePrices();
         $links = $this->links();
+        $review = array();
         $lines = array();
         $missing = 0;
         $total = 0;
+        $revalued = 0;
+        $delta = 0;
         foreach ($rows as $r) {
             if (empty($links[(int) $r->product_id])) {
                 $missing++;
                 continue;
             }
+            $amount = (float) $r->amt;
+            $ref = isset($reference[(int) $r->product_id]) ? $reference[(int) $r->product_id] : NULL;
+            if ($ref === NULL && $amount / $r->qty > 0) {
+                $unbought = isset($unbought) ? $unbought + 1 : 1;
+                $review[] = array($r->product_id, 'never bought, kept', round($amount, 2), '');
+            }
+            if ($ref !== NULL) {
+                $ratio = ($amount / $r->qty) / $ref;
+                if ($ratio < 1 / 3) {
+                    $review[] = array($r->product_id, 'below purchase price, kept', round($amount, 2), round($r->qty * $ref, 2));
+                }
+                if ($ratio > 3) {
+                    $fixed = round($r->qty * $ref, 2);
+                    $this->say(sprintf('  revalued %d: %.2f -> %.2f (unit %.4f, real %.4f)', $r->product_id, $amount, $fixed, $amount / $r->qty, $ref));
+                    $delta += $fixed - $amount;
+                    $amount = $fixed;
+                    $revalued++;
+                }
+            }
             $first = $links[(int) $r->product_id][0];
             $lines[] = array('assetSkuId' => $first['assetSkuId'], 'factor' => $first['factor'],
-                             'quantity' => $this->dec($r->qty), 'amount' => (int) round($r->amt * 10000));
-            $total += $r->amt;
+                             'quantity' => $this->dec($r->qty), 'amount' => (int) round($amount * 10000));
+            $total += $amount;
         }
-        $this->say(sprintf('%d products, %.2f GEL; %d without a Rilven product', count($lines), $total, $missing));
+        $this->say(sprintf('%d products, %.2f GEL (%d brought down to the purchase price, %+.2f; %d never bought, kept as booked); %d without a Rilven product',
+            count($lines), $total, $revalued, $delta, isset($unbought) ? $unbought : 0, $missing));
+        $f = fopen('/root/rilven-history-opening-review.csv', 'w');
+        fputcsv($f, array('product_id', 'note', 'opening_value', 'at_purchase_price'));
+        foreach ($review as $row) {
+            fputcsv($f, $row);
+        }
+        fclose($f);
         if ($missing > 0) {
             $this->say('run history_products first');
             return;
@@ -340,7 +376,7 @@ class Rilven_medic extends MY_Controller
         foreach (array_chunk($lines, 500) as $i => $chunk) {
             $answer = $this->rilven_client->put('/medic-consumption/history/opening', array(
                 'externalId'         => 'history-opening-2025-01-01-' . ($i + 1),
-                'warehouseId'        => (int) $this->config->item('rilven_medic_history_warehouse_id'),
+                'warehouseId'        => (int) $this->rilven_client->cfg('rilven_medic_history_warehouse_id'),
                 'date'               => '2025-01-01 06:00:00',
                 'counterAccountCode' => '1620',
                 'lines'              => $chunk,
@@ -366,7 +402,7 @@ class Rilven_medic extends MY_Controller
             $this->say('usage: admin/rilven_medic history_month <YYYY-MM> <employee tax code> [dry]');
             return;
         }
-        $this->config->set_item('rilven_timeout', 1800);
+        $this->rilven_client->override('rilven_timeout', 1800);
         $from = $month . '-01';
         $to = date('Y-m-d', strtotime($from . ' +1 month'));
         $last = date('Y-m-d', strtotime($to . ' -1 day'));
@@ -377,6 +413,7 @@ class Rilven_medic extends MY_Controller
             'inventory' => array(5, "(a.acount_id = 3 AND a.warehouse_id = 112)"),
         );
         $links = $this->links();
+        $reference = $this->purchasePrices();
         foreach ($groups as $key => $g) {
             $rows = $this->db->query("SELECT a.product_id, MAX(p.name) name, SUM(a.credit_count - a.debet_count) qty,
                        SUM(a.credit_amount - a.debet_amount) amt
@@ -396,8 +433,18 @@ class Rilven_medic extends MY_Controller
                     $missing[] = $r->product_id;
                     continue;
                 }
+                // what a shortfall is received at: our cost, unless it is more than 3x the purchase
+                // price -- our write-off cost carries the same errors as the stock
+                $amount = max(0.0, (float) $r->amt);
+                $ref = isset($reference[(int) $r->product_id]) ? $reference[(int) $r->product_id] : NULL;
+                if ($ref !== NULL && $r->qty > 0) {
+                    // only down, for the reason the opening is only brought down
+                    if ($amount > 0 && ($amount / $r->qty) / $ref > 3) {
+                        $amount = round($r->qty * $ref, 2);
+                    }
+                }
                 $lines[] = array('label' => mb_substr((string) $r->name, 0, 200), 'quantity' => $this->dec($r->qty),
-                                 'amount' => max(0, (int) round($r->amt * 10000)), 'skus' => $l);
+                                 'amount' => (int) round($amount * 10000), 'skus' => $l);
                 $total += $r->amt;
             }
             $this->say(sprintf('%s %s: %d lines, %.2f GEL%s', $month, $key, count($lines), $total,
@@ -407,7 +454,7 @@ class Rilven_medic extends MY_Controller
             }
             $answer = $this->rilven_client->put('/medic-consumption/history/month', array(
                 'externalId'         => 'history-' . $month . '-' . $key,
-                'warehouseId'        => (int) $this->config->item('rilven_medic_history_warehouse_id'),
+                'warehouseId'        => (int) $this->rilven_client->cfg('rilven_medic_history_warehouse_id'),
                 'date'               => $last . ' 12:00:00',
                 'receiptDate'        => $from . ' 12:00:00',
                 'counterAccountCode' => '1620',
@@ -425,6 +472,30 @@ class Rilven_medic extends MY_Controller
                 $d['status'], $d['waybillId'], $d['writtenOff'] / 10000, $d['receiptWaybillId'] ? $d['receiptWaybillId'] : '-',
                 $d['receivedLines'], $d['received'] / 10000));
         }
+    }
+
+    /** Take a posted history document back in Rilven (newest first): admin/rilven_medic history_undo <externalId> */
+    public function history_undo($externalId = '')
+    {
+        $this->cliOnly();
+        if (!preg_match('/^history-[0-9a-z-]+$/', $externalId)) {
+            $this->say('usage: admin/rilven_medic history_undo <history-...>');
+            return;
+        }
+        $this->rilven_client->override('rilven_timeout', 1800);
+        $answer = $this->rilven_client->request('DELETE', '/medic-consumption/delete', array('externalId' => $externalId));
+        $this->say($externalId . ': ' . ($answer['ok'] ? $answer['data']['status'] : 'FAILED ' . $answer['error']));
+    }
+
+    /** product_id => the unit price it was bought at since 2024 (purchases, which are the RS invoices). */
+    private function purchasePrices()
+    {
+        $out = array();
+        foreach ($this->db->query('SELECT product_id, SUM(debet_amount) a, SUM(debet_count) q FROM ' . $this->db->dbprefix('store_action')
+                . " WHERE acount_id = 1 AND posted_date >= '2024-01-01' GROUP BY product_id HAVING q > 0 AND a > 0")->result() as $x) {
+            $out[(int) $x->product_id] = $x->a / $x->q;
+        }
+        return $out;
     }
 
     /** product_id => [{assetSkuId, factor}], purchase-learned first, the most bought first. */
