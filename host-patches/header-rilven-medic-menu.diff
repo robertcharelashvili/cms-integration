@@ -1,0 +1,16 @@
+--- a/themes/default/admin/views/header.php
++++ b/themes/default/admin/views/header.php
+@@ -659,6 +659,13 @@
+                                                                 class="text"> <?= lang('medications'); ?></span>
+                                                     </a>
+                                                 </li>
++                                                <?php if ($Owner || $Admin) { ?>
++                                                <li id="rilven_medic_mapping">
++                                                    <a class="submenu" href="<?= admin_url('rilven_medic/mapping'); ?>">
++                                                        <i class="fa fa-link"></i><span class="text"> Rilven: დაკავშირება</span>
++                                                    </a>
++                                                </li>
++                                                <?php } ?>
+                                             </ul>
+ 
+                                         </li>
