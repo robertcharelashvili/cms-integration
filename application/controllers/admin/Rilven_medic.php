@@ -8,6 +8,8 @@
  *                                                       was rolled back): reversed
  *   php index.php admin/rilven_medic products [days]    the medicines used lately that Rilven cannot
  *                                                       match to its catalogue: what to map first
+ *   php index.php admin/rilven_medic push_products [days]  the medicines used lately, with how often,
+ *                                                       sent to Rilven's mapping screen
  *   php index.php admin/rilven_medic status
  *
  * The same pages open in a browser for the Owner.
@@ -85,6 +87,33 @@ class Rilven_medic extends MY_Controller
         }
         $this->say(sprintf('[%s] rilven medic reconcile: %d in Rilven, %d without a document here, %d reversed',
             date('Y-m-d H:i:s'), count($ids), count($ids) - count($here), $reversed));
+    }
+
+    public function push_products($days = '90')
+    {
+        $days = max(1, min(730, (int) $days));
+        $rows = $this->db->select('i.product_id, MAX(p.code) AS code, MAX(p.name) AS name, MAX(i.product_unit_code) AS unit,'
+                . ' COUNT(*) AS used, MAX(DATE(i.post_date)) AS last_used', FALSE)
+            ->from('sale_items_medic i')->join('products p', 'p.id = i.product_id', 'left')
+            ->where('i.post_date >=', date('Y-m-d', strtotime('-' . $days . ' days')))
+            ->group_by('i.product_id')->get()->result();
+        $sent = 0;
+        foreach (array_chunk($rows, 1000) as $chunk) {
+            $products = array();
+            foreach ($chunk as $r) {
+                $products[] = array('productId' => (string) $r->product_id, 'code' => mb_substr((string) $r->code, 0, 64),
+                    'name' => mb_substr((string) $r->name, 0, 255), 'unit' => mb_substr((string) $r->unit, 0, 64),
+                    'usedCount' => (int) $r->used, 'lastUsed' => (string) $r->last_used);
+            }
+            $answer = $this->rilven_client->put('/medic-consumption/products', array('products' => $products));
+            if (!$answer['ok']) {
+                $this->say('STOPPED: ' . $answer['error']);
+                return;
+            }
+            $sent += count($products);
+        }
+        $this->say(sprintf('[%s] rilven medic: %d products used in %d days sent to the mapping screen',
+            date('Y-m-d H:i:s'), $sent, $days));
     }
 
     public function products($days = '90')
