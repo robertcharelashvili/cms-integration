@@ -664,15 +664,17 @@ $config['rilven_sale_item_table']   = 'sale_items';
 // and sale_items.serial_no is their staff id; a team: products.brigada = 1 and one salary_action row
 // per member by sale_item_id. Staff ids are companies.id; Rilven finds them by vat_no (personal
 // number), as payroll does. An unknown performer refuses the case in Rilven, so check the names first.
-$config['rilven_sale_performers']           = FALSE;
+$config['rilven_sale_performers']           = TRUE;
 $config['rilven_performer_product_table']   = 'products';
 $config['rilven_performer_team_column']     = 'brigada';
 $config['rilven_performer_solo_column']     = 'serial_no';
 $config['rilven_performer_team_table']      = 'salary_action';
-// salary_action column with each member's amount, to share the line by; '' = equal shares
-$config['rilven_performer_amount_column']   = '';
-// salary_action column with the member's role; '' = no role
-$config['rilven_performer_role_column']     = '';
+// salary_action column with each member's amount, to share the line by; '' = equal shares.
+// `salary` is what each member earns from the line (187.50 / 40 / 20 / 50 on one surgery).
+$config['rilven_performer_amount_column']   = 'salary';
+// salary_action column with the member's role; '' = no role. position_id names a row of positions.
+$config['rilven_performer_role_column']     = 'position_id';
+$config['rilven_performer_role_table']      = 'positions';
 // a performer Rilven does not know is created there from sma_companies (name, vat_no, phone, email);
 // one with no personal number still refuses the case
 $config['rilven_performer_create_missing']  = TRUE;

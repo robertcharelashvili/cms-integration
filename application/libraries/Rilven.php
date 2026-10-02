@@ -2085,6 +2085,8 @@ class Rilven
         $actions    = (string) $this->client->cfg('rilven_performer_team_table', 'salary_action');
         $amountCol  = (string) $this->client->cfg('rilven_performer_amount_column', '');
         $roleCol    = (string) $this->client->cfg('rilven_performer_role_column', '');
+        // when the role column is an id (salary_action.position_id), the table that names it
+        $roleTable  = (string) $this->client->cfg('rilven_performer_role_table', '');
         $staffTable = (string) $this->client->cfg('rilven_source_table', 'companies');
 
         $productIds = array();
@@ -2122,6 +2124,25 @@ class Rilven
             }
         }
 
+        // the role ids named once, when the role column is an id into a table of names
+        $roleNames = array();
+        if ($roleCol !== '' && $roleTable !== '') {
+            $roleIds = array();
+            foreach ($members as $list) {
+                foreach ($list as $a) {
+                    if (isset($a->role) && (int) $a->role > 0) {
+                        $roleIds[(int) $a->role] = TRUE;
+                    }
+                }
+            }
+            if (!empty($roleIds)) {
+                foreach ($this->CI->db->select('id, name')->from($roleTable)
+                             ->where_in('id', array_keys($roleIds))->get()->result() as $r) {
+                    $roleNames[(int) $r->id] = trim((string) $r->name);
+                }
+            }
+        }
+
         // every staff id we will name, resolved to a personal number and a name once
         $staffIds = array();
         foreach ($items as $item) {
@@ -2149,9 +2170,18 @@ class Rilven
                 foreach ($list as $a) {
                     $sid = (int) $a->staff_id;
                     if (!isset($byStaff[$sid])) {
-                        $byStaff[$sid] = array('amount' => 0.0, 'role' => isset($a->role) ? (string) $a->role : '');
+                        $byStaff[$sid] = array('amount' => 0.0, 'roles' => array());
                     }
                     $byStaff[$sid]['amount'] += isset($a->amount) ? (float) $a->amount : 0.0;
+                    // one person in two positions on one line: one performer, both roles
+                    $role = '';
+                    if (isset($a->role)) {
+                        $role = $roleTable !== '' ? (isset($roleNames[(int) $a->role]) ? $roleNames[(int) $a->role] : '')
+                                                  : trim((string) $a->role);
+                    }
+                    if ($role !== '' && !in_array($role, $byStaff[$sid]['roles'], TRUE)) {
+                        $byStaff[$sid]['roles'][] = $role;
+                    }
                 }
                 $total = 0.0;
                 foreach ($byStaff as $m) {
@@ -2159,7 +2189,7 @@ class Rilven
                 }
                 $shares = $this->shares($byStaff, $amountCol !== '' && $total > 0 ? $total : 0.0);
                 foreach ($byStaff as $sid => $m) {
-                    $item->performers[] = $this->performer($staff, $sid, $shares[$sid], $m['role']);
+                    $item->performers[] = $this->performer($staff, $sid, $shares[$sid], implode(', ', $m['roles']));
                 }
             } elseif (isset($item->$soloColumn) && (int) $item->$soloColumn > 0) {
                 $item->performers[] = $this->performer($staff, (int) $item->$soloColumn, 1000000, '');
