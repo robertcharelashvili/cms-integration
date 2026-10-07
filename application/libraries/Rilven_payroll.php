@@ -277,8 +277,9 @@ class Rilven_payroll
 
     /**
      * The run's per-case breakdown (sma_daricxvebi_detall), after its month: one row per staff x
-     * case line x salary type, types 1-4 only -- 5 and 6 are not case-based. In chunks; the first
-     * says `replace`. Proved on run 489: per staff and type it adds up to by_staff exactly.
+     * case line x salary type, types 1-4 only -- 5 and 6 are not case-based. Through the ordinary
+     * register salary-variable-case: the month's breakdown deleted whole, then inserted in batches.
+     * Proved on run 489: per staff and type it adds up to by_staff exactly.
      *
      * A subservice line (sub = 1) was never sent to Rilven as a line of its own; it goes with its
      * case and the flag, and Rilven counts it against the case only.
@@ -295,15 +296,24 @@ class Rilven_payroll
         $rows = $this->cases((int) $run->id);
         $prefix = (string) $this->client->cfg('rilven_payroll_code_prefix', 'cms-');
         $chunk = max(100, (int) $this->client->cfg('rilven_payroll_cases_chunk', 2000));
+        // the month's document by its code, then its breakdown replaced: deleted whole, inserted in batches
+        $doc = $this->client->get('salary-variable/get/' . rawurlencode($prefix . $run->month), array('by' => 'code'));
+        if (!$doc['ok'] || !isset($doc['data']['salaryVariable']['id'])) {
+            $result['ok'] = FALSE;
+            $result['error'] = 'cases: the month ' . $prefix . $run->month . ' is not in Rilven (' . $doc['error'] . ')';
+            return $result;
+        }
+        $docId = (int) $doc['data']['salaryVariable']['id'];
+        $gone = $this->client->request('DELETE', 'salary-variable-case/delete', array('salaryVariableId' => $docId));
+        if (!$gone['ok']) {
+            $result['ok'] = FALSE;
+            $result['error'] = 'cases: ' . $gone['error'];
+            return $result;
+        }
         $written = 0;
         $unknown = 0;
-        $parts = $rows ? array_chunk($rows, $chunk) : array(array());
-        foreach ($parts as $i => $part) {
-            $answer = $this->client->post('salary-variable/cases-sync', array(
-                'code'    => $prefix . $run->month,
-                'replace' => $i === 0,
-                'items'   => $part,
-            ));
+        foreach ($rows ? array_chunk($rows, $chunk) : array() as $part) {
+            $answer = $this->client->post('salary-variable-case/insert', array('salaryVariableId' => $docId, 'items' => $part));
             if (!$answer['ok']) {
                 $result['ok'] = FALSE;
                 $result['error'] = 'cases: ' . $answer['error'];
@@ -400,23 +410,199 @@ class Rilven_payroll
         if (!$force && $this->client->state('payroll_cards') === $fingerprint) {
             return $result;
         }
-        $inserted = 0; $updated = 0; $skipped = 0;
-        foreach (array_chunk($cards, max(50, (int) $this->client->cfg('rilven_payroll_cards_chunk', 300))) as $part) {
-            $answer = $this->client->post('salary-variable/cards-sync', array('items' => $part));
-            if (!$answer['ok']) {
-                $result['ok'] = FALSE;
-                $result['error'] = 'cards: ' . $answer['error'];
-                return $result;
-            }
-            $data = isset($answer['data']) ? $answer['data'] : array();
-            $inserted += isset($data['inserted']) ? (int) $data['inserted'] : 0;
-            $updated  += isset($data['updated']) ? (int) $data['updated'] : 0;
-            $skipped  += isset($data['skipped']) ? count($data['skipped']) : 0;
+        $counts = array('inserted' => 0, 'updated' => 0, 'unchanged' => 0, 'skipped' => 0);
+        $error = $this->writeCards($cards, $counts);
+        if ($error !== '') {
+            $result['ok'] = FALSE;
+            $result['error'] = 'cards: ' . $error;
+            return $result;
         }
         $this->client->setState('payroll_cards', $fingerprint);
         $result['sent'] = TRUE;
-        $result['error'] = sprintf('inserted %d, updated %d, skipped %d', $inserted, $updated, $skipped);
+        $result['error'] = sprintf('inserted %d, updated %d, unchanged %d, skipped %d',
+            $counts['inserted'], $counts['updated'], $counts['unchanged'], $counts['skipped']);
         return $result;
+    }
+
+    /**
+     * The cards written through Rilven's ordinary salary-card register, as a person at the screen
+     * would: the employee found by personal number (or a unique name), the position and department by
+     * their codes (created when Rilven has none), the card by its code -- inserted when new, updated
+     * only when something the CMS owns changed. Rilven owns the expense account and the branch once
+     * the card exists, so an update sends back what Rilven has for those.
+     *
+     * @return string the error that stopped it, '' when it went through
+     */
+    private function writeCards(array $cards, array &$counts)
+    {
+        // who: every employee once, by personal number and by name
+        $byTax = array(); $byName = array(); $ambiguous = array();
+        for ($page = 1; ; $page++) {
+            $answer = $this->client->get('employee/list', array('page' => $page));
+            if (!$answer['ok']) {
+                return 'employee/list: ' . $answer['error'];
+            }
+            $items = isset($answer['data']['pagination']['items']) ? $answer['data']['pagination']['items'] : array();
+            foreach ($items as $e) {
+                $tax = trim((string) (isset($e['taxCode']) ? $e['taxCode'] : ''));
+                if ($tax !== '' && !isset($byTax[$tax])) {
+                    $byTax[$tax] = (int) $e['id'];
+                }
+                $given = mb_strtolower(trim((string) $e['givenName']));
+                $family = mb_strtolower(trim((string) $e['familyName']));
+                foreach (array_unique(array($family . ' ' . $given, $given . ' ' . $family)) as $key) {
+                    if (trim($key) === '') { continue; }
+                    if (isset($byName[$key]) && $byName[$key] !== (int) $e['id']) { $ambiguous[$key] = TRUE; }
+                    $byName[$key] = (int) $e['id'];
+                }
+            }
+            if (count($items) === 0 || $page * 25 >= (int) $answer['data']['pagination']['total']) {
+                break;
+            }
+        }
+        // what Rilven already holds, by code
+        $existing = array();
+        for ($page = 1; ; $page++) {
+            $answer = $this->client->get('employee-salary/list', array('is-external' => 'true', 'page' => $page));
+            if (!$answer['ok']) {
+                return 'employee-salary/list: ' . $answer['error'];
+            }
+            $items = isset($answer['data']['pagination']['items']) ? $answer['data']['pagination']['items'] : array();
+            foreach ($items as $c) {
+                $existing[(string) $c['code']] = $c;
+            }
+            if (count($items) === 0 || $page * 25 >= (int) $answer['data']['pagination']['total']) {
+                break;
+            }
+        }
+        // what a new card needs from Rilven: the company's currency, the branch, the 7320 expense map
+        $company = $this->client->get('company/get/' . (int) $this->client->companyId());
+        $currencyId = isset($company['data']['item']['currencyId']) ? (int) $company['data']['item']['currencyId'] : 0;
+        $branchId = (int) $this->client->cfg('rilven_payroll_company_branch_id', 0);
+        $maps = $this->client->post('account-plan/map/filter', array('type' => array(27)));
+        $mapId = 0;
+        foreach (isset($maps['data']['items']) ? $maps['data']['items'] : array() as $m) {
+            if ((string) $m['code'] === (string) $this->client->cfg('rilven_payroll_card_account', '7320')) {
+                $mapId = (int) $m['id'];
+                break;
+            }
+        }
+        if (!$currencyId || !$branchId || !$mapId) {
+            return sprintf('defaults missing (currency %d, branch %d, expense map %d)', $currencyId, $branchId, $mapId);
+        }
+
+        $positions = array(); $departments = array();
+        foreach ($cards as $card) {
+            $tax = trim((string) $card['employeeTaxCode']);
+            $employeeId = isset($byTax[$tax]) ? $byTax[$tax] : NULL;
+            if ($employeeId === NULL) {
+                $key = mb_strtolower(preg_replace('/\s+/u', ' ', trim((string) $card['employeeName'])));
+                if (isset($byName[$key]) && !isset($ambiguous[$key])) {
+                    $employeeId = $byName[$key];
+                }
+            }
+            if ($employeeId === NULL) {
+                $counts['skipped']++;   // a CMS staff member who is not an employee in Rilven
+                continue;
+            }
+            $positionId = $this->idByCode('position', $card['positionCode'], $card['positionName'], $positions);
+            $departmentId = $this->idByCode('department', $card['departmentCode'], $card['departmentName'], $departments);
+            $code = 'cms-sp-' . $card['code'];
+            $kind = (int) $card['kind'];
+            $body = array(
+                'code'          => $code,
+                'name'          => $card['positionName'] !== '' ? $card['positionName'] : '-',
+                'positionId'    => $positionId,
+                'departmentId'  => $departmentId,
+                'salaryType'    => $kind === 2 ? 1 : ($kind === 3 ? 2 : 4),
+                // a figure only where the CMS quotes a wage; a variable rate stays text ('30%', '10')
+                'salary'        => $kind === 1 ? 0 : $this->amount($card['rate']),
+                'status'        => (int) $card['status'],
+                'dateStart'     => $card['dateStart'],
+                'dateEnd'       => $card['dateEnd'],
+                'isExternal'    => TRUE,
+                'externalKind'  => $kind,
+                'caseKind'      => $card['caseKind'],
+                'rate'          => $card['rate'] === '' ? NULL : $card['rate'],
+            );
+            if (!isset($existing[$code])) {
+                $answer = $this->client->post('employee-salary/insert', $body + array(
+                    'employeeId' => $employeeId, 'companyBranchId' => $branchId,
+                    'currencyId' => $currencyId, 'accountPlanMapId' => $mapId));
+                if (!$answer['ok']) {
+                    return 'employee-salary/insert ' . $code . ': ' . $answer['error'];
+                }
+                $counts['inserted']++;
+                continue;
+            }
+            $had = $existing[$code];
+            if ($this->sameCard($had, $body)) {
+                $counts['unchanged']++;
+                continue;
+            }
+            // what Rilven owns goes back as Rilven has it
+            $answer = $this->client->put('employee-salary/update', $body + array(
+                'id' => (int) $had['id'], 'companyBranchId' => $had['companyBranchId'], 'currencyId' => $had['currencyId'],
+                'accountPlanMapId' => $had['accountPlanMapId'], 'workTimeGroupId' => $had['workTimeGroupId'],
+                'workRateTypeId' => $had['workRateTypeId'], 'overtimeRate' => $had['overtimeRate'],
+                'remote' => !empty($had['isRemote'])));
+            if (!$answer['ok']) {
+                return 'employee-salary/update ' . $code . ': ' . $answer['error'];
+            }
+            $counts['updated']++;
+        }
+        return '';
+    }
+
+    /** Whether nothing the CMS owns differs between Rilven's card and what the CMS would send. */
+    private function sameCard(array $had, array $body)
+    {
+        $pairs = array('name' => 'name', 'positionId' => 'positionId', 'departmentId' => 'departmentId',
+                       'salaryType' => 'salaryType', 'salary' => 'salary', 'status' => 'status',
+                       'dateStart' => 'dateStart', 'dateEnd' => 'dateEnd', 'externalKind' => 'externalKind',
+                       'caseKind' => 'caseKind', 'rate' => 'rate');
+        foreach ($pairs as $theirs => $ours) {
+            $a = isset($had[$theirs]) ? (string) $had[$theirs] : '';
+            $b = isset($body[$ours]) && $body[$ours] !== NULL ? (string) $body[$ours] : '';
+            if (in_array($theirs, array('dateStart', 'dateEnd'), TRUE)) {
+                $a = substr($a, 0, 10);
+            }
+            if ($a !== $b) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+
+    /**
+     * Rilven's id of a position or department the CMS knows by its own code, through the register's
+     * own ?by=code; created there when it has none (a name is needed for that). Cached per run.
+     */
+    private function idByCode($register, $code, $name, array &$cache)
+    {
+        if ($code === NULL || $code === '') {
+            return NULL;
+        }
+        if (array_key_exists($code, $cache)) {
+            return $cache[$code];
+        }
+        $answer = $this->client->get($register . '/get/' . rawurlencode($code), array('by' => 'code'));
+        $id = NULL;
+        if ($answer['ok'] && isset($answer['data']['item']['id'])) {
+            $id = (int) $answer['data']['item']['id'];
+        } elseif ($answer['error'] === '[code]-not-found' && $name !== NULL && $name !== '') {
+            $made = $this->client->post($register . '/insert', array('code' => $code, 'name' => $name));
+            $id = $made['ok'] && isset($made['data']['id']) ? (int) $made['data']['id'] : NULL;
+        }
+        $cache[$code] = $id;
+        return $id;
+    }
+
+    /** "1875" or "1875.50" as Rilven money (x10000); a percentage or nothing is 0. */
+    private function amount($rate)
+    {
+        $v = str_replace(',', '.', trim((string) $rate));
+        return ($v === '' || strpos($v, '%') !== FALSE || !is_numeric($v)) ? 0 : (int) round((float) $v * 10000);
     }
 
     /** A MySQL date as yyyy-mm-dd, or NULL for none and for the zero date. */
