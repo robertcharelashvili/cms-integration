@@ -591,6 +591,19 @@ class Rilven_payroll
         if ($answer['ok'] && isset($answer['data']['item']['id'])) {
             $id = (int) $answer['data']['item']['id'];
         } elseif ($answer['error'] === '[code]-not-found' && $name !== NULL && $name !== '') {
+            // Rilven may already have it under another code: LJ's departments predate this sync and
+            // carry their own codes (1, 3, 5...), and the old sync matched them by name. Creating a
+            // twin here split 592 cards off their departments (2026-10-07). The name first, exactly.
+            // the oldest of the exact matches: the filter does not hide a soft-deleted twin
+            $found = $this->client->post($register . '/filter', array('key' => $name));
+            foreach (isset($found['data']['items']) ? $found['data']['items'] : array() as $row) {
+                if (mb_strtolower(trim((string) $row['name'])) === mb_strtolower(trim((string) $name))
+                    && ($id === NULL || (int) $row['id'] < $id)) {
+                    $id = (int) $row['id'];
+                }
+            }
+        }
+        if ($id === NULL && $answer['error'] === '[code]-not-found' && $name !== NULL && $name !== '') {
             $made = $this->client->post($register . '/insert', array('code' => $code, 'name' => $name));
             $id = $made['ok'] && isset($made['data']['id']) ? (int) $made['data']['id'] : NULL;
         }
