@@ -240,6 +240,31 @@ class Rilven_payroll
         return $this->sendCasesOf($run, $fingerprint, $force, $result);
     }
 
+    /**
+     * One month's per-case breakdown alone, sent again now, the month's lines untouched:
+     * `php index.php admin/rilven_sync payroll_cases 2026-03`. For a breakdown that needs resending
+     * when the month itself does not (a month already in payroll, or a fix on this side).
+     */
+    public function syncCases($month)
+    {
+        if (!preg_match('/^\d{4}-\d{2}$/', (string) $month)) {
+            return array('month' => $month, 'ok' => FALSE, 'error' => 'month must be YYYY-MM');
+        }
+        foreach ($this->latestRuns($month . '-01') as $run) {
+            if ($run->month === $month) {
+                $fingerprint = $this->fingerprintOf($run->id);
+                $result = array('month' => $month, 'run' => (int) $run->id, 'ok' => TRUE, 'error' => '', 'sent' => FALSE);
+                if (!$this->casesEnabled()) {
+                    $result['ok'] = FALSE;
+                    $result['error'] = 'rilven_payroll_cases_enabled is off';
+                    return $result;
+                }
+                return $this->sendCasesOf($run, $fingerprint, TRUE, $result);
+            }
+        }
+        return array('month' => $month, 'ok' => FALSE, 'error' => 'no CONFIRMED payroll run for this month');
+    }
+
     public function cardsEnabled()
     {
         return $this->client->cfg('rilven_payroll_cards_enabled', FALSE) ? TRUE : FALSE;
@@ -300,16 +325,23 @@ class Rilven_payroll
     {
         $detall = $this->CI->db->dbprefix('daricxvebi_detall');
         $comp   = $this->CI->db->dbprefix('companies');
-        $sql = "SELECT d.staff_id, TRIM(c.vat_no) AS tax_code, c.name AS staff_name, d.salary_type,"
+        // The name exactly as the month's lines send it (by_staff.staff_name), the card's name only
+        // when the run has no line for the person: Rilven falls back to the name for staff with no
+        // personal number, and two spellings of one person found the line and lost the cases
+        // (2025-10 and 2026-03, one pair each).
+        $staff  = $this->CI->db->dbprefix('daricxva_by_staff');
+        $sql = "SELECT d.staff_id, TRIM(c.vat_no) AS tax_code, COALESCE(bs.staff_name, c.name) AS staff_name, d.salary_type,"
              . " d.sale_id, d.sale_item_id, MAX(d.sub) AS sub, d.position_id, d.warehouse_id,"
              . " MAX(d.ganyofileba) AS department_name, SUM(ROUND(d.salary * 10000)) AS amount"
              . " FROM {$detall} d LEFT JOIN {$comp} c ON c.id = d.staff_id"
+             . " LEFT JOIN (SELECT staff_id, MAX(staff_name) AS staff_name FROM {$staff} WHERE did = ? GROUP BY staff_id) bs"
+             . "        ON bs.staff_id = d.staff_id"
              . " WHERE d.did = ? AND d.salary_type BETWEEN 1 AND 4"
-             . " GROUP BY d.staff_id, c.vat_no, c.name, d.salary_type, d.sale_id, d.sale_item_id, d.position_id, d.warehouse_id"
+             . " GROUP BY d.staff_id, c.vat_no, bs.staff_name, c.name, d.salary_type, d.sale_id, d.sale_item_id, d.position_id, d.warehouse_id"
              . " HAVING SUM(ROUND(d.salary * 10000)) <> 0"
              . " ORDER BY d.staff_id, d.sale_id, d.sale_item_id";
         $items = array();
-        foreach ($this->CI->db->query($sql, array($did))->result() as $r) {
+        foreach ($this->CI->db->query($sql, array($did, $did))->result() as $r) {
             $items[] = array(
                 'employeeTaxCode' => (string) $r->tax_code,
                 'employeeName'    => (string) $r->staff_name,

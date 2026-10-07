@@ -23,6 +23,7 @@
  *   index     JSON: what is waiting, what failed and why. Also the browser page.
  *   payroll   the variable part of one month's payroll: payroll 2026-08 [force]
  *   payroll_cards  the salary cards (sma_staff_positions), all of them: payroll_cards [force]
+ *   payroll_cases  one month's per-case breakdown alone, again: payroll_cases 2026-03
  */
 class Rilven_sync extends MY_Controller
 {
@@ -135,6 +136,17 @@ class Rilven_sync extends MY_Controller
     {
         $this->load->library('rilven_payroll');
         $this->sayPayroll($this->rilven_payroll->syncCards($force === 'force'));
+    }
+
+    /**
+     * One month's per-case breakdown alone, sent again now; the month's lines are not touched:
+     *
+     *     php index.php admin/rilven_sync payroll_cases 2026-03
+     */
+    public function payroll_cases($month = '')
+    {
+        $this->load->library('rilven_payroll');
+        $this->sayPayroll($this->rilven_payroll->syncCases($month));
     }
 
     private function sayPayroll($m)
