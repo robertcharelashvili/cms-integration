@@ -381,7 +381,12 @@ class Rilven_payroll
         $comp = $this->CI->db->dbprefix('companies');
         $pos  = $this->CI->db->dbprefix('positions');
         $wh   = $this->CI->db->dbprefix('warehouses');
-        $sql = "SELECT sp.id, TRIM(c.vat_no) AS tax_code, c.name AS staff_name, sp.position_id, p.name AS position_name,"
+        // The surname and the given name: staff with no personal number are found by name, and for
+        // some the CMS keeps only the surname in `name` and the given name in `company` (how
+        // sma_fix_salary shows them) -- the surname alone found nobody and lost their cards.
+        $sql = "SELECT sp.id, TRIM(c.vat_no) AS tax_code, TRIM(CONCAT_WS(' ', c.name, NULLIF(TRIM(c.company), ''))) AS staff_name,"
+             . " TRIM(c.name) AS staff_name_alone,"
+             . " sp.position_id, p.name AS position_name,"
              . " sp.warehouse, w.name AS warehouse_name, sp.salary_type, sp.type_of_accident, sp.ammount, sp.status,"
              . " sp.start_date, sp.end_date"
              . " FROM {$sp} sp LEFT JOIN {$comp} c ON c.id = sp.staff_id"
@@ -393,6 +398,8 @@ class Rilven_payroll
                 'code'            => (string) $r->id,
                 'employeeTaxCode' => (string) $r->tax_code,
                 'employeeName'    => (string) $r->staff_name,
+                // the name field alone, tried second: for most staff it already holds the full name
+                'employeeNameAlone' => (string) $r->staff_name_alone,
                 'positionCode'    => $r->position_id === NULL ? NULL : (string) $r->position_id,
                 'positionName'    => trim((string) $r->position_name),
                 'departmentCode'  => $r->warehouse === NULL ? NULL : 'cms-' . $r->warehouse,
@@ -495,9 +502,12 @@ class Rilven_payroll
         foreach ($cards as $card) {
             $tax = trim((string) $card['employeeTaxCode']);
             $employeeId = isset($byTax[$tax]) ? $byTax[$tax] : NULL;
-            if ($employeeId === NULL) {
-                $key = mb_strtolower(preg_replace('/\s+/u', ' ', trim((string) $card['employeeName'])));
-                if (isset($byName[$key]) && !isset($ambiguous[$key])) {
+            foreach (array('employeeName', 'employeeNameAlone') as $field) {
+                if ($employeeId !== NULL || !isset($card[$field])) {
+                    continue;
+                }
+                $key = mb_strtolower(preg_replace('/\s+/u', ' ', trim((string) $card[$field])));
+                if ($key !== '' && isset($byName[$key]) && !isset($ambiguous[$key])) {
                     $employeeId = $byName[$key];
                 }
             }
