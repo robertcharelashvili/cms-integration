@@ -1122,5 +1122,16 @@ $config['rilven_payroll_company_branch_id'] = 30;
 // staff of these departments are expensed on the admin account; everybody else on 7320
 $config['rilven_payroll_admin_departments'] = array('ადმინისტრაცია');
 $config['rilven_payroll_admin_account'] = '7410';
+// The salary cards (sma_staff_positions) as Rilven's EXTERNAL cards: how each person is paid --
+// a variable rate per case kind, fixed pay, duty by timesheet -- under which position. Rilven never
+// computes an external card; it names the card each month's line was paid under. Sent whole when
+// anything changed. By hand: php index.php admin/rilven_sync payroll_cards [force]
+$config['rilven_payroll_cards_enabled'] = FALSE;
+$config['rilven_payroll_cards_chunk'] = 300;
+// Each confirmed month's variable pay case by case (sma_daricxvebi_detall, types 1-4), after the
+// month itself, in chunks. Proved on run 489: per staff and type it adds up to by_staff exactly.
+// A subservice goes with its case only (it has no line of its own in Rilven).
+$config['rilven_payroll_cases_enabled'] = FALSE;
+$config['rilven_payroll_cases_chunk'] = 2000;
 // who may confirm a payroll run for Rilven in the salary register, besides the owner (sma_groups.name)
 $config['rilven_payroll_confirm_groups'] = array('accounting', 'chief_accountant');

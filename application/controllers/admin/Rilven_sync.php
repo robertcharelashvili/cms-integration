@@ -22,6 +22,7 @@
  *             Dry unless told otherwise: close 2026-09-01 2026-09-30 yes
  *   index     JSON: what is waiting, what failed and why. Also the browser page.
  *   payroll   the variable part of one month's payroll: payroll 2026-08 [force]
+ *   payroll_cards  the salary cards (sma_staff_positions), all of them: payroll_cards [force]
  */
 class Rilven_sync extends MY_Controller
 {
@@ -124,12 +125,26 @@ class Rilven_sync extends MY_Controller
         $this->sayPayroll($this->rilven_payroll->syncMonth($month, $force === 'force'));
     }
 
+    /**
+     * The salary cards, sent now (they are also sent by the cron when rilven_payroll_cards_enabled):
+     *
+     *     php index.php admin/rilven_sync payroll_cards
+     *     php index.php admin/rilven_sync payroll_cards force
+     */
+    public function payroll_cards($force = '')
+    {
+        $this->load->library('rilven_payroll');
+        $this->sayPayroll($this->rilven_payroll->syncCards($force === 'force'));
+    }
+
     private function sayPayroll($m)
     {
         $this->say(sprintf('[%s] rilven: payroll %s run=%s lines=%s amount=%s %s', date('Y-m-d H:i:s'),
             $m['month'], isset($m['run']) ? $m['run'] : '-', isset($m['lines']) ? $m['lines'] : '-',
             isset($m['amount']) ? number_format($m['amount'], 2, '.', '') : '-',
-            $m['ok'] ? (!empty($m['sent']) ? 'sent' : 'unchanged') : 'REFUSED: ' . $m['error']));
+            ($m['ok'] ? (!empty($m['sent']) ? 'sent' : 'unchanged') : 'REFUSED: ' . $m['error'])
+            . (isset($m['cases']) ? sprintf(' cases=%d unknown-staff=%d', $m['cases'], $m['casesUnknownStaff']) : '')
+            . ($m['ok'] && $m['month'] === 'cards' && !empty($m['sent']) ? ' (' . $m['error'] . ')' : '')));
     }
 
     /**

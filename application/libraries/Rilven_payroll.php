@@ -43,10 +43,9 @@ class Rilven_payroll
     /**
      * CMS salary type -> Rilven component. The same numbers, kept apart on purpose.
      *
-     * 5 (duty shifts) and 6 (fixed pay) are sent too since 2026-09-30: LJ keeps no salary cards
-     * in Rilven, so without them the fixed part was paid by nobody. Rilven refuses an accrual
-     * for anybody who has BOTH a salary card and a type-6 line (salary-variable-fixed-pay-twice):
-     * the month cards are introduced, 6 comes out of this list.
+     * 5 (duty shifts) and 6 (fixed pay) are sent too since 2026-09-30. The salary cards this
+     * library sends (syncCards) arrive in Rilven as EXTERNAL cards, which its accrual never pays,
+     * so 6 stays here: the card says how a person is paid, the line is what the run paid.
      */
     const COMPONENTS = array(1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6);
 
@@ -81,9 +80,17 @@ class Rilven_payroll
             $back  = max(1, (int) $this->client->cfg('rilven_payroll_months_back', 3));
             $since = $this->client->clinicToday('-' . $back . ' months');
         }
+        $out = array();
+        // the cards first, so the months that follow can name the card each line was paid under
+        if ($this->cardsEnabled()) {
+            $cards = $this->syncCards(FALSE);
+            if ($cards['sent'] || !$cards['ok']) {
+                $out[] = $cards;
+            }
+        }
         $runs = $this->latestRuns($since);
         if (!$runs) {
-            return array();
+            return $out;
         }
 
         // Which months changed, from ONE aggregate over every run -- not by building each
@@ -93,10 +100,10 @@ class Rilven_payroll
         // A cap per tick: a first catch-up of twenty months must not hold the cron for minutes.
         // The oldest first, so the ledger fills in order; the rest follow on the next ticks.
         $budget = max(1, (int) $this->client->cfg('rilven_payroll_months_per_tick', 2));
-        $out = array();
         foreach ($runs as $run) {
             $fp = isset($fingerprints[(int) $run->id]) ? $fingerprints[(int) $run->id] : $run->id . ':0:0';
-            if ($this->client->state('payroll_' . $run->month) === $fp) {
+            if ($this->client->state('payroll_' . $run->month) === $fp
+                && (!$this->casesEnabled() || $this->client->state('payroll_cases_' . $run->month) === $fp)) {
                 continue;
             }
             if ((string) $run->confirmed_fingerprint !== $fp) {
@@ -203,7 +210,7 @@ class Rilven_payroll
                         'amount' => $total / 10000, 'ok' => TRUE, 'error' => '', 'sent' => FALSE);
 
         if (!$force && $this->client->state($stateKey) === $fingerprint) {
-            return $result;
+            return $this->sendCasesOf($run, $fingerprint, $force, $result);
         }
 
         $prefix = (string) $this->client->cfg('rilven_payroll_code_prefix', 'cms-');
@@ -224,11 +231,167 @@ class Rilven_payroll
             // until somebody deletes that accrual or a newer run appears
             if (strpos($answer['error'], 'salary-variable-is-in-payroll') === 0) {
                 $this->client->setState($stateKey, $fingerprint);
+                // the month is frozen by payroll, but its breakdown only explains it: still sent
+                return $this->sendCasesOf($run, $fingerprint, $force, $result);
             }
             return $result;
         }
         $this->client->setState($stateKey, $fingerprint);
+        return $this->sendCasesOf($run, $fingerprint, $force, $result);
+    }
+
+    public function cardsEnabled()
+    {
+        return $this->client->cfg('rilven_payroll_cards_enabled', FALSE) ? TRUE : FALSE;
+    }
+
+    public function casesEnabled()
+    {
+        return $this->client->cfg('rilven_payroll_cases_enabled', FALSE) ? TRUE : FALSE;
+    }
+
+    /**
+     * The run's per-case breakdown (sma_daricxvebi_detall), after its month: one row per staff x
+     * case line x salary type, types 1-4 only -- 5 and 6 are not case-based. In chunks; the first
+     * says `replace`. Proved on run 489: per staff and type it adds up to by_staff exactly.
+     *
+     * A subservice line (sub = 1) was never sent to Rilven as a line of its own; it goes with its
+     * case and the flag, and Rilven counts it against the case only.
+     */
+    private function sendCasesOf($run, $fingerprint, $force, $result)
+    {
+        if (!$this->casesEnabled()) {
+            return $result;
+        }
+        $stateKey = 'payroll_cases_' . $run->month;
+        if (!$force && $this->client->state($stateKey) === $fingerprint) {
+            return $result;
+        }
+        $rows = $this->cases((int) $run->id);
+        $prefix = (string) $this->client->cfg('rilven_payroll_code_prefix', 'cms-');
+        $chunk = max(100, (int) $this->client->cfg('rilven_payroll_cases_chunk', 2000));
+        $written = 0;
+        $unknown = 0;
+        $parts = $rows ? array_chunk($rows, $chunk) : array(array());
+        foreach ($parts as $i => $part) {
+            $answer = $this->client->post('salary-variable/cases-sync', array(
+                'code'    => $prefix . $run->month,
+                'replace' => $i === 0,
+                'items'   => $part,
+            ));
+            if (!$answer['ok']) {
+                $result['ok'] = FALSE;
+                $result['error'] = 'cases: ' . $answer['error'];
+                return $result;
+            }
+            $data = isset($answer['data']) ? $answer['data'] : array();
+            $written += isset($data['written']) ? (int) $data['written'] : 0;
+            $unknown += isset($data['unknownEmployees']) ? count($data['unknownEmployees']) : 0;
+        }
+        $this->client->setState($stateKey, $fingerprint);
+        $result['sent'] = TRUE;
+        $result['cases'] = $written;
+        $result['casesUnknownStaff'] = $unknown;
         return $result;
+    }
+
+    /** The run's case rows, summed per staff x case line x type x position, as Rilven's items. */
+    private function cases($did)
+    {
+        $detall = $this->CI->db->dbprefix('daricxvebi_detall');
+        $comp   = $this->CI->db->dbprefix('companies');
+        $sql = "SELECT d.staff_id, TRIM(c.vat_no) AS tax_code, c.name AS staff_name, d.salary_type,"
+             . " d.sale_id, d.sale_item_id, MAX(d.sub) AS sub, d.position_id, d.warehouse_id,"
+             . " MAX(d.ganyofileba) AS department_name, SUM(ROUND(d.salary * 10000)) AS amount"
+             . " FROM {$detall} d LEFT JOIN {$comp} c ON c.id = d.staff_id"
+             . " WHERE d.did = ? AND d.salary_type BETWEEN 1 AND 4"
+             . " GROUP BY d.staff_id, c.vat_no, c.name, d.salary_type, d.sale_id, d.sale_item_id, d.position_id, d.warehouse_id"
+             . " HAVING SUM(ROUND(d.salary * 10000)) <> 0"
+             . " ORDER BY d.staff_id, d.sale_id, d.sale_item_id";
+        $items = array();
+        foreach ($this->CI->db->query($sql, array($did))->result() as $r) {
+            $items[] = array(
+                'employeeTaxCode' => (string) $r->tax_code,
+                'employeeName'    => (string) $r->staff_name,
+                'component'       => self::COMPONENTS[(int) $r->salary_type],
+                'caseCode'        => $r->sale_id === NULL ? NULL : (string) $r->sale_id,
+                'lineCode'        => $r->sale_item_id === NULL ? NULL : (string) $r->sale_item_id,
+                'subservice'      => (int) $r->sub === 1,
+                'positionCode'    => $r->position_id === NULL ? NULL : (string) $r->position_id,
+                'departmentCode'  => $r->warehouse_id === NULL ? NULL : 'cms-' . $r->warehouse_id,
+                'departmentName'  => trim((string) $r->department_name),
+                'amount'          => (int) $r->amount,
+            );
+        }
+        return $items;
+    }
+
+    /**
+     * The salary cards (sma_staff_positions) as Rilven's external cards, all of them, when anything
+     * about them changed since the last send. Rilven matches each by its code and reports back the
+     * staff it does not know as employees.
+     *
+     * @param bool $force send even when nothing changed
+     */
+    public function syncCards($force = FALSE)
+    {
+        $sp   = $this->CI->db->dbprefix('staff_positions');
+        $comp = $this->CI->db->dbprefix('companies');
+        $pos  = $this->CI->db->dbprefix('positions');
+        $wh   = $this->CI->db->dbprefix('warehouses');
+        $sql = "SELECT sp.id, TRIM(c.vat_no) AS tax_code, c.name AS staff_name, sp.position_id, p.name AS position_name,"
+             . " sp.warehouse, w.name AS warehouse_name, sp.salary_type, sp.type_of_accident, sp.ammount, sp.status,"
+             . " sp.start_date, sp.end_date"
+             . " FROM {$sp} sp LEFT JOIN {$comp} c ON c.id = sp.staff_id"
+             . " LEFT JOIN {$pos} p ON p.id = sp.position_id LEFT JOIN {$wh} w ON w.id = sp.warehouse"
+             . " WHERE sp.salary_type IN (1, 2, 3) ORDER BY sp.id";
+        $cards = array();
+        foreach ($this->CI->db->query($sql)->result() as $r) {
+            $cards[] = array(
+                'code'            => (string) $r->id,
+                'employeeTaxCode' => (string) $r->tax_code,
+                'employeeName'    => (string) $r->staff_name,
+                'positionCode'    => $r->position_id === NULL ? NULL : (string) $r->position_id,
+                'positionName'    => trim((string) $r->position_name),
+                'departmentCode'  => $r->warehouse === NULL ? NULL : 'cms-' . $r->warehouse,
+                'departmentName'  => trim((string) $r->warehouse_name),
+                'kind'            => (int) $r->salary_type,
+                'caseKind'        => $r->type_of_accident === NULL ? NULL : (int) $r->type_of_accident,
+                'rate'            => trim((string) $r->ammount),
+                'status'          => $r->status === NULL ? 1 : (int) $r->status,
+                'dateStart'       => $this->date($r->start_date),
+                'dateEnd'         => $this->date($r->end_date),
+            );
+        }
+        $fingerprint = md5(json_encode($cards));
+        $result = array('month' => 'cards', 'lines' => count($cards), 'ok' => TRUE, 'error' => '', 'sent' => FALSE);
+        if (!$force && $this->client->state('payroll_cards') === $fingerprint) {
+            return $result;
+        }
+        $inserted = 0; $updated = 0; $skipped = 0;
+        foreach (array_chunk($cards, max(50, (int) $this->client->cfg('rilven_payroll_cards_chunk', 300))) as $part) {
+            $answer = $this->client->post('salary-variable/cards-sync', array('items' => $part));
+            if (!$answer['ok']) {
+                $result['ok'] = FALSE;
+                $result['error'] = 'cards: ' . $answer['error'];
+                return $result;
+            }
+            $data = isset($answer['data']) ? $answer['data'] : array();
+            $inserted += isset($data['inserted']) ? (int) $data['inserted'] : 0;
+            $updated  += isset($data['updated']) ? (int) $data['updated'] : 0;
+            $skipped  += isset($data['skipped']) ? count($data['skipped']) : 0;
+        }
+        $this->client->setState('payroll_cards', $fingerprint);
+        $result['sent'] = TRUE;
+        $result['error'] = sprintf('inserted %d, updated %d, skipped %d', $inserted, $updated, $skipped);
+        return $result;
+    }
+
+    /** A MySQL date as yyyy-mm-dd, or NULL for none and for the zero date. */
+    private function date($value)
+    {
+        $v = trim((string) $value);
+        return preg_match('/^\d{4}-\d{2}-\d{2}/', $v) && substr($v, 0, 4) !== '0000' ? substr($v, 0, 10) : NULL;
     }
 
     /** The run's variable-pay rows, as Rilven's lines. */
@@ -240,7 +403,7 @@ class Rilven_payroll
         $types = implode(',', array_map('intval', array_keys(self::COMPONENTS)));
 
         // the department by NAME: warehouse_id is not filled on these rows
-        $sql = "SELECT s.id, s.salary_type, s.daricxuli_sul AS amount, s.warehouse_name,"
+        $sql = "SELECT s.id, s.salary_type, s.daricxuli_sul AS amount, s.warehouse_name, s.position_id, s.position_name,"
              . " TRIM(c.vat_no) AS tax_code, s.staff_name,"
              . " (SELECT MIN(w.id) FROM {$wh} w WHERE w.name = s.warehouse_name) AS warehouse_id"
              . " FROM {$staff} s LEFT JOIN {$comp} c ON c.id = s.staff_id"
@@ -266,6 +429,9 @@ class Rilven_payroll
                 // decimal GEL -> Rilven money, x10000; round() absorbs the float error of the cast
                 'amount'          => (int) round((float) $r->amount * 10000),
                 'comment'         => (string) $r->staff_name,
+                // with the employee and the component it names the salary card the line was paid under
+                'positionCode'    => $r->position_id === NULL ? NULL : (string) $r->position_id,
+                'positionName'    => trim((string) $r->position_name),
             );
             if (in_array($name, $admin, TRUE)) {
                 $line['accountCode'] = $adminAccount;
